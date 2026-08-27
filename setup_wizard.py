@@ -11,10 +11,12 @@ It will:
   2. Show currently plugged-in USB devices and let you pick your security key.
      Only a SHA256 hash of the device serial is stored (never the raw serial,
      never the spoofable vendor/product id).
-  3. Optionally enable "auto-unlock": derive the vault password from the USB
-     serial + machine-id so you never get prompted - just plug the key in.
-  4. Set the default allowed-apps list.
-  5. Write config to ~/.config/vault-guardian/config.json
+  3. Set the default allowed-apps list.
+  4. Write config to ~/.config/vault-guardian/config.json
+
+Auto-unlock is intentionally not offered. A blob in your config is readable
+by any same-user process (including an AI agent), which is the threat this
+tool exists to block.
 
 This module also exposes config load/save helpers used by the tray app.
 """
@@ -43,7 +45,7 @@ DEFAULT_PLAIN_DIR = os.path.expanduser("~/.vault-plain")   # gocryptfs target
 DEFAULT_MOUNT = os.path.expanduser("~/Vault")               # guarded, user sees
 
 DEFAULT_ALLOWED_APPS = ["libreoffice", "firefox", "evince", "gedit",
-                        "code", "kate"]
+                        "kate"]
 
 
 # --- config helpers --------------------------------------------------------
@@ -191,20 +193,20 @@ def run_wizard(non_interactive: bool = False) -> Dict:
 
     # 1) Vault creation ----------------------------------------------------
     enc = _prompt("Encrypted vault directory", cfg["encrypted_dir"])
-    plain = _prompt("Internal plaintext dir (hidden)", cfg["plain_dir"])
     mount = _prompt("Guarded mount point you will use", cfg["mount_point"])
-    cfg["encrypted_dir"], cfg["plain_dir"], cfg["mount_point"] = enc, plain, mount
+    cfg["encrypted_dir"] = enc
+    cfg["mount_point"] = mount
+    # plain_dir is unused at runtime (plaintext lives on a private tmpfs
+    # inside the guard's mount namespace). Kept in config for lock-time
+    # cleanup of leftover mounts from older versions.
 
     os.makedirs(enc, exist_ok=True)
-    os.makedirs(plain, mode=0o700, exist_ok=True)
-    os.chmod(plain, 0o700)
     os.makedirs(mount, exist_ok=True)
 
     vault_password = ""
     if vault_manager.vault_is_initialized(enc):
         print(f"\nA vault already exists at {enc} - keeping it.")
-        if not cfg.get("auto_unlock"):
-            print("You will still be prompted for its password at unlock time.")
+        print("You will be prompted for its password at unlock time.")
     else:
         print("\nCreate a strong password for your encrypted vault.")
         while True:
@@ -233,24 +235,13 @@ def run_wizard(non_interactive: bool = False) -> Dict:
         print("  No USB key registered - you can add one later from the tray "
               "menu ('Change USB Key...').")
 
-    # 3) Auto-unlock -------------------------------------------------------
-    if cfg.get("usb_serial_hash") and vault_password:
-        print("\nAuto-unlock: derive the vault password from the USB key so "
-              "you're never prompted - just plug the key in.")
-        ans = _prompt("  Enable auto-unlock? (y/N)", "n").lower()
-        if ans in ("y", "yes"):
-            cfg["auto_unlock"] = True
-            cfg["autounlock_blob"] = encrypt_autounlock(
-                vault_password, cfg["usb_serial_hash"])
-            print("  Auto-unlock enabled. The encrypted secret can only be "
-                  "recovered on THIS machine with THIS key.")
-        else:
-            cfg["auto_unlock"] = False
-            cfg["autounlock_blob"] = None
-    elif cfg.get("usb_serial_hash") and not vault_password and \
-            not cfg.get("auto_unlock"):
-        print("\n(To enable auto-unlock you must set it up when creating the "
-              "vault password. Re-create the vault to enable it later.)")
+    # 3) Auto-unlock is not offered. A same-user agent can read config.json
+    #    and recover the blob, which is exactly the threat model.
+    cfg["auto_unlock"] = False
+    cfg["autounlock_blob"] = None
+    print("\nAuto-unlock is disabled: storing a decryptable password blob "
+          "in your home directory would let any same-user process "
+          "(including an AI agent) unlock the vault.")
 
     # 4) Allowed apps ------------------------------------------------------
     print("\nDefault allowed apps (only these may read the open vault):")
@@ -272,6 +263,8 @@ def run_wizard(non_interactive: bool = False) -> Dict:
     except Exception:
         pass
 
+    cfg["auto_unlock"] = False
+    cfg["autounlock_blob"] = None
     save_config(cfg)
     print("\n" + "=" * 64)
     print(" Setup complete. Config saved to:")

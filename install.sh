@@ -89,7 +89,7 @@ copy_app() {
     info "Installing application to ${APP_DIR}"
     mkdir -p "${APP_DIR}" "${BIN_DIR}"
     for f in vault_guardian.py tray_app.py setup_wizard.py vault_manager.py \
-             usb_monitor.py apparmor_manager.py no_sudo_fuse_guard.py \
+             usb_monitor.py apparmor_manager.py no_sudo_fuse_guard.py mountns.py \
              requirements.txt README.md; do
         install -m 0644 "${SRC_DIR}/${f}" "${APP_DIR}/${f}"
     done

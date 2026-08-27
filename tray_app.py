@@ -5,20 +5,22 @@ tray_app.py
 The main Vault Guardian system-tray application. It wires together:
 
   * usb_monitor   - detects the registered USB key add/remove
-  * vault_manager - mounts/unmounts the gocryptfs ciphertext
-  * no_sudo_fuse_guard - the per-app allowlist guard (run as a subprocess)
+  * vault_manager - unmount of the user-visible FUSE mount
+  * no_sudo_fuse_guard - private mount ns + gocryptfs + per-app allowlist
   * apparmor_manager - optional kernel hardening
-  * setup_wizard  - config load/save + auto-unlock crypto
+  * setup_wizard  - config load/save
 
 State machine
 -------------
   LOCKED  --(key inserted / manual mount)-->  OPEN
   OPEN    --(key removed / Lock Now / suspend)--> LOCKED
 
-When OPEN:
-  1. gocryptfs mounts  encrypted_dir -> plain_dir   (700, internal)
-  2. FUSE guard mounts plain_dir     -> mount_point  (what apps use)
-Only allow-listed apps can read mount_point; everything else gets EACCES.
+When OPEN the guard subprocess:
+  1. unshares a user+mount namespace
+  2. mounts gocryptfs onto a private tmpfs (invisible to other same-uid tasks)
+  3. FUSE-exports that onto mount_point (visible on the host to allowed apps)
+Only the calling executable is allow-listed (no parent-walk). Everything else
+gets EACCES. Auto-unlock blobs are ignored: a same-user agent can read them.
 """
 
 from __future__ import annotations
@@ -213,13 +215,18 @@ class VaultGuardian:
 
     # -- unlock / lock -----------------------------------------------------
     def _get_password(self) -> Optional[str]:
-        if self.cfg.get("auto_unlock") and self.cfg.get("autounlock_blob") \
-                and self.cfg.get("usb_serial_hash"):
-            pw = cfgmod.decrypt_autounlock(self.cfg["autounlock_blob"],
-                                           self.cfg["usb_serial_hash"])
-            if pw is not None:
-                return pw
-            log_event("WARN", "auto-unlock failed; falling back to prompt")
+        # Auto-unlock stores a decryptable blob in the user's config. Any
+        # same-uid agent can read it, so it is incompatible with the threat
+        # model. Wipe a leftover blob if we find one, then always prompt.
+        if self.cfg.get("auto_unlock") or self.cfg.get("autounlock_blob"):
+            self.cfg["auto_unlock"] = False
+            self.cfg["autounlock_blob"] = None
+            try:
+                cfgmod.save_config(self.cfg)
+            except OSError:
+                pass
+            log_event("CONFIG",
+                      "disabled auto-unlock (same-user agent can recover the blob)")
         return ask_password("Enter vault password to unlock")
 
     def open_vault(self, reason: str = "manual") -> bool:
@@ -233,30 +240,21 @@ class VaultGuardian:
                 return False
 
             enc = self.cfg["encrypted_dir"]
-            plain = self.cfg["plain_dir"]
             mount = self.cfg["mount_point"]
 
-            os.makedirs(plain, mode=0o700, exist_ok=True)
-            try:
-                os.chmod(plain, 0o700)
-            except OSError:
-                pass
-
-            # 1) mount gocryptfs ciphertext -> plaintext (internal dir).
-            try:
-                vault_manager.mount_vault(enc, plain, password)
-            except vault_manager.VaultError as e:
-                log_event("ERROR", f"gocryptfs mount failed: {e}")
-                show_message("Unlock failed", str(e))
-                return False
-            finally:
-                password = "\x00" * len(password)  # best-effort scrub
-                del password
-
-            # 2) start FUSE guard: plaintext -> user-visible guarded mount.
-            if not self._start_guard(plain, mount):
-                log_event("ERROR", "FUSE guard failed to start; locking again")
-                vault_manager.unmount_vault(plain)
+            # Guard enters a private mount ns, mounts gocryptfs there, then
+            # FUSE-exports mount_point. Password goes on stdin, never argv.
+            ok = self._start_guard(enc, mount, password)
+            password = "\x00" * len(password)
+            del password
+            if not ok:
+                log_event("ERROR", "FUSE guard failed to start; vault stays locked")
+                show_message(
+                    "Unlock failed",
+                    "Could not start the vault guard. If this machine disables "
+                    "unprivileged user namespaces, unlock cannot hide the "
+                    "plaintext from other same-user processes, so it refuses "
+                    "rather than mounting in the clear. See the log.")
                 return False
 
             # 3) optional AppArmor hardening.
@@ -274,7 +272,7 @@ class VaultGuardian:
             self._refresh_icon()
             return True
 
-    def _start_guard(self, plain: str, mount: str) -> bool:
+    def _start_guard(self, cipherdir: str, mount: str, password: str) -> bool:
         # Ensure any stale guard mount is cleared first.
         if vault_manager.is_mounted(mount):
             vault_manager.unmount_vault(mount)
@@ -282,18 +280,24 @@ class VaultGuardian:
         os.makedirs(mount, exist_ok=True)
         os.makedirs(cfgmod.DATA_DIR, exist_ok=True)
         logf = open(cfgmod.LOG_PATH, "a", encoding="utf-8")
-        cmd = [sys.executable, GUARD_SCRIPT, plain, mount, "--apps"] \
+        cmd = [sys.executable, "-u", GUARD_SCRIPT, cipherdir, mount, "--apps"] \
             + list(self.cfg["allowed_apps"])
         try:
             self.guard_proc = subprocess.Popen(
-                cmd, stdout=logf, stderr=logf,
+                cmd, stdin=subprocess.PIPE, stdout=logf, stderr=logf,
                 start_new_session=True)
+            try:
+                self.guard_proc.stdin.write((password + "\n").encode("utf-8"))
+                self.guard_proc.stdin.close()
+            except BrokenPipeError:
+                log_event("ERROR", "guard closed stdin before receiving password")
+                return False
         except Exception as e:
             log_event("ERROR", f"could not launch guard: {e}")
             return False
 
         # Wait for the guard mount to appear.
-        for _ in range(60):
+        for _ in range(150):
             if vault_manager.is_mounted(mount):
                 return True
             if self.guard_proc.poll() is not None:
@@ -305,32 +309,36 @@ class VaultGuardian:
     def lock_vault(self, reason: str = "manual") -> None:
         with self.state_lock:
             mount = self.cfg["mount_point"]
-            plain = self.cfg["plain_dir"]
+            plain = self.cfg.get("plain_dir")
             log_event("LOCK", f"lock requested ({reason})")
 
-            # 1) unmount guard (user-visible) FIRST so plaintext vanishes.
+            # 1) unmount the user-visible FUSE export FIRST.
             try:
                 vault_manager.unmount_vault(mount)
             except vault_manager.VaultError as e:
                 log_event("WARN", f"guard unmount: {e}")
 
-            # 2) stop guard process.
+            # 2) kill the guard process group (gocryptfs is a child).
             if self.guard_proc and self.guard_proc.poll() is None:
                 try:
-                    self.guard_proc.terminate()
+                    os.killpg(self.guard_proc.pid, signal.SIGTERM)
                     self.guard_proc.wait(timeout=3)
                 except Exception:
                     try:
-                        self.guard_proc.kill()
+                        os.killpg(self.guard_proc.pid, signal.SIGKILL)
                     except Exception:
-                        pass
+                        try:
+                            self.guard_proc.kill()
+                        except Exception:
+                            pass
             self.guard_proc = None
 
-            # 3) unmount gocryptfs plaintext.
-            try:
-                vault_manager.unmount_vault(plain)
-            except vault_manager.VaultError as e:
-                log_event("WARN", f"gocryptfs unmount: {e}")
+            # 3) leftover host plaintext mount from older versions.
+            if plain:
+                try:
+                    vault_manager.unmount_vault(plain)
+                except vault_manager.VaultError as e:
+                    log_event("WARN", f"legacy plaintext unmount: {e}")
 
             # 4) remove AppArmor profile.
             if self.cfg.get("use_apparmor"):
@@ -504,14 +512,8 @@ class VaultGuardian:
             d = devices[idx]
             self.cfg["usb_serial_hash"] = d["serial_hash"]
             self.cfg["usb_label"] = d["name"]
-            # Auto-unlock blob is tied to the old serial hash; invalidate it.
-            if self.cfg.get("auto_unlock"):
-                self.cfg["auto_unlock"] = False
-                self.cfg["autounlock_blob"] = None
-                show_message("Vault Guardian",
-                             "USB key changed. Auto-unlock was disabled because "
-                             "it was tied to the previous key - re-run setup to "
-                             "re-enable it with the new key.")
+            self.cfg["auto_unlock"] = False
+            self.cfg["autounlock_blob"] = None
             cfgmod.save_config(self.cfg)
             log_event("CONFIG", f"USB key changed to {d['name']}")
             # Restart monitor with new hash.

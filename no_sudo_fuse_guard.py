@@ -8,42 +8,36 @@ current user - no root, no AppArmor required.
 How it fits together
 ---------------------
     ~/.vault-encrypted/      <- gocryptfs ciphertext (on disk)
-            |  gocryptfs mount (allow_other)
+            |  gocryptfs, mounted inside this process's private mount ns
             v
-    ~/.vault-plain/          <- decrypted plaintext, restrictive perms,
-            |                    only THIS guard process reads it
+    private tmpfs            <- decrypted plaintext, invisible to other
+            |                    same-user processes (including agents)
             |  FUSE passthrough with per-caller allowlist check
             v
-    ~/Vault/                 <- what the user & apps actually see
+    ~/Vault/                 <- what the user & allowed apps actually see
+                                (FUSE mount propagates to the host ns)
 
 Every VFS operation that arrives at ~/Vault/ carries the PID of the calling
 process (via fuse_get_context()). We resolve /proc/<pid>/exe to the real
-executable path and compare it (and its parent chain) against the allowlist.
-Anything not on the list gets EACCES - including an AI agent driving the
-machine through python/bash/xdotool, because *its* executable is
-python3/bash, not libreoffice.
-
-Why check the parent chain too?
--------------------------------
-Some allowed apps spawn helper processes (e.g. LibreOffice's soffice.bin).
-We walk up a few parents so a legitimately-allowed app's own children are
-also permitted, while still blocking unrelated processes.
+executable path and compare it against the allowlist. Ancestors are NOT
+consulted: an agent spawned from VS Code/Cursor must not inherit access
+just because `code` is allowed.
 
 Security caveats (documented honestly)
 --------------------------------------
-* An attacker running as the same user who can *rename/replace* an allowed
-  binary, or ptrace an allowed process, could bypass this. That requires more
-  than a naive file read, and combined with the USB-gated mount it raises the
-  bar substantially.
-* This guard's plaintext backing dir (~/.vault-plain) is chmod 700 and is
-  only meant to be reached *through* the guard. We also refuse to serve it to
-  callers whose exe we cannot resolve.
+* An attacker running as the same user who can *replace* an allowed
+  binary, or ptrace an allowed process, could bypass the allowlist.
+  The private mount ns still keeps ~/.vault-plain from a naive `open()`.
+* PID reuse between fuse_get_context() and /proc/<pid>/exe is a known
+  FUSE TOCTOU. Fail closed if the exe cannot be resolved.
 """
 
 from __future__ import annotations
 
 import errno
 import os
+import signal
+import subprocess
 import sys
 import threading
 from typing import List, Optional, Set
@@ -61,16 +55,17 @@ except Exception:  # pragma: no cover
         return (0, 0, 0)
 
     class FuseOSError(OSError):  # type: ignore
-        # Mirror fusepy's behaviour: FuseOSError(errno) sets .errno so callers
-        # (and tests) can inspect it even when libfuse is absent.
         def __init__(self, err_code):
             super().__init__(err_code, os.strerror(err_code))
 
 
-# Executable basenames that are ALWAYS allowed to traverse (never leak data
-# themselves) so the desktop can stat the mount. 'ls'/'stat' from a shell are
-# deliberately NOT here - listing is treated as access.
-_INFRA_ALWAYS: Set[str] = set()
+# Helpers launched by an allowed app under a different basename. These are
+# added only when the corresponding app is on the allowlist; we do not walk
+# parent PIDs.
+_APP_HELPERS = {
+    "libreoffice": {"soffice", "soffice.bin", "oosplash"},
+    "soffice": {"soffice.bin", "oosplash"},
+}
 
 
 def _read_exe(pid: int) -> Optional[str]:
@@ -81,30 +76,17 @@ def _read_exe(pid: int) -> Optional[str]:
         return None
 
 
-def _read_ppid(pid: int) -> Optional[int]:
-    """Return the parent PID of *pid* from /proc/<pid>/stat."""
-    try:
-        with open(f"/proc/{pid}/stat", "rb") as fh:
-            data = fh.read()
-        # Format: pid (comm) state ppid ...  - comm may contain spaces/parens
-        rparen = data.rfind(b")")
-        rest = data[rparen + 2:].split()
-        # rest[0] = state, rest[1] = ppid
-        return int(rest[1])
-    except (OSError, IndexError, ValueError):
-        return None
-
-
 class AllowlistPolicy:
-    """Decides whether a calling PID may access the vault."""
+    """Decides whether a calling PID may access the vault.
 
-    def __init__(self, allowed_apps: List[str], self_pid: int,
-                 max_parent_depth: int = 4) -> None:
-        # Store both basenames and resolved absolute paths of allowed apps.
+    Only the calling process is considered, never its parents. A Cursor
+    agent whose parent is `code` must not get a free pass.
+    """
+
+    def __init__(self, allowed_apps: List[str], self_pid: int) -> None:
         self.allowed_names: Set[str] = set()
         self.allowed_paths: Set[str] = set()
         self.self_pid = self_pid
-        self.max_parent_depth = max_parent_depth
         self.update(allowed_apps)
 
     def update(self, allowed_apps: List[str]) -> None:
@@ -123,9 +105,7 @@ class AllowlistPolicy:
                 resolved = shutil.which(app)
                 if resolved:
                     paths.add(os.path.realpath(resolved))
-                # LibreOffice launches soffice.bin - allow that helper too.
-                if app in ("libreoffice", "soffice"):
-                    names.update({"soffice", "soffice.bin", "oosplash"})
+                names.update(_APP_HELPERS.get(app, set()))
         self.allowed_names = names
         self.allowed_paths = paths
 
@@ -134,37 +114,16 @@ class AllowlistPolicy:
             return False
         if exe in self.allowed_paths:
             return True
-        base = os.path.basename(exe)
-        if base in self.allowed_names:
-            return True
-        # Allow "app" to match "app-bin"/"app.bin" style helpers.
-        for name in self.allowed_names:
-            if base == name or base.startswith(name + ".") or \
-               base.startswith(name + "-"):
-                return True
-        return False
+        return os.path.basename(exe) in self.allowed_names
 
     def is_pid_allowed(self, pid: int) -> bool:
-        """True if *pid* (or a near ancestor) is an allowed application."""
         if pid <= 0:
             return False
-        # Never allow the guard's own process to recurse into itself in a way
-        # that would create loops, but the guard reads the backing dir
-        # directly (not through FUSE), so its pid arriving here is external.
-        seen: Set[int] = set()
-        current = pid
-        for _ in range(self.max_parent_depth + 1):
-            if current in seen or current <= 1:
-                break
-            seen.add(current)
-            exe = _read_exe(current)
-            if self._exe_allowed(exe):
-                return True
-            parent = _read_ppid(current)
-            if parent is None:
-                break
-            current = parent
-        return False
+        # The FUSE daemon itself must be able to getattr the mount root.
+        # It already has the plaintext tmpfs; this is not a new hole.
+        if pid == self.self_pid:
+            return True
+        return self._exe_allowed(_read_exe(pid))
 
 
 class VaultGuardFS(Operations):
@@ -181,7 +140,6 @@ class VaultGuardFS(Operations):
         self.log_fn = log_fn or (lambda *a, **k: None)
         self.rwlock = threading.Lock()
 
-    # -- helpers -----------------------------------------------------------
     def _full(self, partial: str) -> str:
         partial = partial.lstrip("/")
         return os.path.join(self.backing, partial)
@@ -193,20 +151,16 @@ class VaultGuardFS(Operations):
             exe = _read_exe(pid) or "<unknown>"
             self.log_fn("DENY", op, path, pid, exe)
             raise FuseOSError(errno.EACCES)
-        # Only log actual data-bearing operations to keep the log readable.
         if op in ("open", "read", "write", "create", "unlink", "readdir"):
             exe = _read_exe(pid) or "<unknown>"
             self.log_fn("ALLOW", op, path, pid, exe)
 
-    # -- filesystem methods ------------------------------------------------
     def access(self, path, mode):
         self._check("access", path)
         if not os.access(self._full(path), mode):
             raise FuseOSError(errno.EACCES)
 
     def getattr(self, path, fh=None):
-        # getattr is extremely chatty and needed for the mount to exist at
-        # all; we still gate it so a denied process can't even stat contents.
         self._check("getattr", path)
         st = os.lstat(self._full(path))
         return {key: getattr(st, key) for key in (
@@ -281,7 +235,6 @@ class VaultGuardFS(Operations):
         with open(self._full(path), "r+") as f:
             f.truncate(length)
 
-    # -- file handle ops ---------------------------------------------------
     def open(self, path, flags):
         self._check("open", path)
         return os.open(self._full(path), flags)
@@ -304,8 +257,6 @@ class VaultGuardFS(Operations):
             return os.write(fh, buf)
 
     def flush(self, path, fh):
-        # No allowlist check on flush/release: the handle was already gated
-        # at open() time; blocking flush could corrupt an allowed writer.
         return os.fsync(fh)
 
     def release(self, path, fh):
@@ -315,12 +266,80 @@ class VaultGuardFS(Operations):
         return os.fsync(fh)
 
 
-def run_guard(backing: str, mountpoint: str, allowed_apps: List[str],
-              log_fn=None, foreground: bool = True,
-              allow_other: bool = False) -> None:
-    """Mount the guard FS. Blocks until unmounted (when foreground=True)."""
+def _pdeathsig():
+    """Kill this process if the parent guard dies."""
+    try:
+        import ctypes
+        import ctypes.util
+        libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+        PR_SET_PDEATHSIG = 1
+        libc.prctl(PR_SET_PDEATHSIG, signal.SIGTERM)
+    except Exception:
+        pass
+
+
+def _mount_gocryptfs(cipherdir: str, backing: str, password: bytes) -> None:
+    import shutil
+    import time
+    import vault_manager
+    gocryptfs = shutil.which("gocryptfs")
+    if not gocryptfs:
+        raise RuntimeError("gocryptfs not found on PATH")
+    pw = password if password.endswith(b"\n") else password + b"\n"
+    # Stay in the foreground so we remain a child of the guard. Daemonizing
+    # would reparent to init and drop PR_SET_PDEATHSIG.
+    proc = subprocess.Popen(
+        [gocryptfs, "-q", "-fg", cipherdir, backing],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        preexec_fn=_pdeathsig,
+    )
+    try:
+        proc.stdin.write(pw)
+        proc.stdin.close()
+    except BrokenPipeError:
+        pass
+    for _ in range(80):
+        if vault_manager.is_mounted(backing):
+            return
+        if proc.poll() is not None:
+            raise RuntimeError(
+                f"gocryptfs mount failed (exit {proc.returncode})"
+            )
+        time.sleep(0.05)
+    if not vault_manager.is_mounted(backing):
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+        raise RuntimeError("gocryptfs did not come up in time")
+
+
+def run_guard(cipherdir: str, mountpoint: str, allowed_apps: List[str],
+              password: bytes, log_fn=None, foreground: bool = True) -> None:
+    """Isolate plaintext, mount gocryptfs, then FUSE-export *mountpoint*.
+
+    Refuses to run if the private mount namespace cannot be entered: falling
+    back to a world-visible ~/.vault-plain would re-open the same-user hole.
+    """
     if FUSE is None:
         raise RuntimeError("fusepy is not installed. pip install fusepy")
+
+    import mountns
+
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    backing = os.path.join(runtime, "vault-guardian-plain")
+
+    try:
+        mountns.isolate_for_guard(backing)
+    except OSError as e:
+        raise RuntimeError(
+            "Could not enter a private mount namespace "
+            f"({e}). Unlock aborted rather than exposing plaintext "
+            "to every same-user process."
+        ) from e
+
+    _mount_gocryptfs(cipherdir, backing, password)
 
     os.makedirs(mountpoint, exist_ok=True)
     policy = AllowlistPolicy(allowed_apps, self_pid=os.getpid())
@@ -331,8 +350,7 @@ def run_guard(backing: str, mountpoint: str, allowed_apps: List[str],
         mountpoint,
         foreground=foreground,
         nothreads=False,
-        allow_other=allow_other,
-        # default_permissions lets the kernel also enforce unix perms.
+        allow_other=False,
         default_permissions=True,
     )
 
@@ -342,17 +360,19 @@ if __name__ == "__main__":
 
     ap = argparse.ArgumentParser(
         description="Vault Guardian userspace FUSE allowlist guard")
-    ap.add_argument("backing", help="Plaintext gocryptfs mount to protect")
+    ap.add_argument("cipherdir", help="gocryptfs ciphertext directory")
     ap.add_argument("mountpoint", help="User-visible guarded mount point")
     ap.add_argument("--apps", nargs="*",
                     default=["libreoffice", "firefox", "evince", "gedit",
-                             "code", "kate"],
+                             "kate"],
                     help="Allowed application names / paths")
-    ap.add_argument("--allow-other", action="store_true")
     ns = ap.parse_args()
+    password = sys.stdin.buffer.readline()
+    if not password:
+        sys.exit("vault password required on stdin")
 
     def _log(action, op, path, pid, exe):
         print(f"[{action}] {op} {path} pid={pid} exe={exe}", file=sys.stderr)
 
-    run_guard(ns.backing, ns.mountpoint, ns.apps, log_fn=_log,
-              foreground=True, allow_other=ns.allow_other)
+    run_guard(ns.cipherdir, ns.mountpoint, ns.apps, password,
+              log_fn=_log, foreground=True)
