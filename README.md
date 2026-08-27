@@ -37,13 +37,18 @@ and can `sudo` once.)
 
 ```
    ~/.vault-encrypted/     encrypted files on disk (safe at rest)
-          │  gocryptfs decrypts  (only while USB key present)
+          │  gocryptfs decrypts inside the guard's private mount namespace
           ▼
-   ~/.vault-plain/         plaintext, chmod 700, internal — you never use this
-          │  FUSE guard checks the calling app against your allowlist
+   private tmpfs           plaintext, visible only to the guard process
+          │  FUSE guard checks the *calling* executable (no parent-walk)
           ▼
    ~/Vault/                what you and your allowed apps actually open
 ```
+
+The plaintext directory is *not* `~/.vault-plain` on the host. Older versions
+left decrypted files there at mode 700, which any same-user process could
+read. Unlock now fails closed if a private mount namespace cannot be created
+(for example if unprivileged user namespaces are disabled).
 
 - Plug in your registered USB key → the tray icon turns **green** and `~/Vault`
   fills with your files (visible only to allowed apps).
@@ -126,13 +131,15 @@ The wizard (`vault-guardian-setup`) walks you through:
    - Only a **SHA256 hash of the device serial** is stored — never the raw
      serial, and never the vendor/product ID (which any identical model would
      share and is trivially spoofed).
-3. **Optional auto-unlock.** If enabled, your vault password is encrypted with
-   a key derived from `PBKDF2(serial_hash + machine-id, salt, 100000)` and
-   stored in the config. Then you're **never prompted** — plugging the key in
-   is enough, and the secret can only be recovered *on this machine with this
-   key*. If you skip it, you'll get a password prompt at unlock time.
+3. **Password prompt on every unlock.** Auto-unlock is not offered. A blob in
+   `~/.config/vault-guardian/config.json` is readable by any same-user process
+   (including an AI agent), so storing a decryptable copy of the vault password
+   there would defeat the point. Existing blobs are ignored and wiped.
 4. **Allowed apps.** Defaults to
-   `libreoffice, firefox, evince, gedit, code, kate`. Add your own.
+   `libreoffice, firefox, evince, gedit, kate`. Add your own. `code` is
+   intentionally not a default: the allowlist checks only the calling process,
+   so a terminal or agent spawned *from* an editor is denied unless that
+   child binary is itself listed.
 
 Re-run any time with:
 
@@ -187,11 +194,17 @@ The `[DENY]` lines are exactly the AI-agent access attempts you wanted to see.
 
 **What this stops well:**
 - An AI agent (or any process) reading your files via Python, shell, `cat`,
-  `scp`, a scripting tool, or an un-allowed application — blocked with EACCES.
+  `scp`, a scripting tool, or an un-allowed application — blocked with EACCES
+  on `~/Vault`.
+- Direct reads of the decrypted backing store by other same-user processes —
+  the plaintext lives on a private tmpfs inside the guard's mount namespace,
+  not in `~/.vault-plain`.
 - Anyone reading the files when the USB key is absent — they're just
   AES-256-GCM ciphertext.
 - Files lingering decrypted after you unplug, click Lock, or the machine
   sleeps — the vault is force-unmounted (lazy unmount) immediately.
+- Inheriting access through a parent editor (`code`, Cursor, etc.). Only the
+  calling PID's executable is checked.
 
 **What it does *not* fully stop (same-user threat model is inherently hard):**
 - A process running as you that can **replace or modify an allowed binary**, or
@@ -199,14 +212,13 @@ The `[DENY]` lines are exactly the AI-agent access attempts you wanted to see.
   app's identity. That's a much higher bar than a naive file read, but it's
   possible for a determined same-user attacker. Combining with the optional
   AppArmor profile and keeping allowed apps to a minimum reduces this.
-- If you enable auto-unlock, anyone who has **both** your unlocked machine
-  **and** your USB key can open the vault (that's the whole point of the key —
-  treat it like a physical key). Without auto-unlock, they'd also need the
-  password.
-- The FUSE guard checks the calling PID's executable and a few ancestors. It is
-  not a substitute for a full MAC/sandbox; it's a pragmatic, no-root barrier.
+- The FUSE guard is not a substitute for a full MAC/sandbox; it's a pragmatic,
+  no-root barrier. `/proc/<pid>/exe` is also a TOCTOU against PID reuse.
 - Root on the machine can bypass everything. This tool protects against
   same-*user* threats, not against a compromised root.
+- Unlock requires unprivileged user namespaces (`kernel.unprivileged_userns_clone=1`,
+  Ubuntu default). If they are disabled, unlock refuses rather than exposing
+  plaintext on the host.
 
 **Defense-in-depth recommendation:** for the highest-value secrets, the
 strongest option remains a separate, network-limited machine. Vault Guardian is
@@ -231,6 +243,7 @@ top of the FUSE guard. It needs `sudo` once when applied. See
 | `vault_manager.py` | gocryptfs mount / unmount (safe subprocess) |
 | `usb_monitor.py` | udev USB add/remove detection by serial hash |
 | `no_sudo_fuse_guard.py` | **Primary** per-app allowlist FUSE guard (no root) |
+| `mountns.py` | Unprivileged user+mount namespace helper |
 | `apparmor_manager.py` | Optional kernel AppArmor profile generator |
 | `tray_app.py` | System-tray UI + orchestration |
 | `vault_guardian.py` | Entry point launched by systemd/CLI |
@@ -266,8 +279,13 @@ The venv itself is created at install time under
   guard restarts with the new list.
 
 **"Transport endpoint is not connected" on `~/Vault`.**
-- A stale mount. Run: `fusermount -u ~/Vault ; fusermount -u ~/.vault-plain`
-  then unlock again.
+- A stale mount. Run: `fusermount -u ~/Vault` then unlock again.
+  (Older installs may also need `fusermount -u ~/.vault-plain`.)
+
+**Unlock fails with "Could not enter a private mount namespace".**
+- This machine has unprivileged user namespaces disabled. Vault Guardian
+  will not fall back to a host-visible plaintext mount. On Ubuntu check
+  `sysctl kernel.unprivileged_userns_clone` (should be 1).
 
 **pip fails with an externally managed environment.**
 - The installer no longer uses user-site pip. If you see this, you are not
