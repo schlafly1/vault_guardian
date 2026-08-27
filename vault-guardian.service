@@ -5,8 +5,9 @@ PartOf=graphical-session.target
 
 [Service]
 Type=simple
-# %h expands to the user's home directory.
-ExecStart=%h/.local/share/vault-guardian/vault_guardian.py
+# %h expands to the user's home directory. Use the venv interpreter so pip
+# packages never need to live on the system Python.
+ExecStart=%h/.local/share/vault-guardian/venv/bin/python %h/.local/share/vault-guardian/vault_guardian.py
 Restart=on-failure
 RestartSec=3
 # Lock the vault cleanly when the service is stopped.

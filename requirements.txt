@@ -1,5 +1,6 @@
 # Vault Guardian Python dependencies
-# Install with: pip install --user -r requirements.txt
+# Installed into ~/.local/share/vault-guardian/venv by ./install.sh
+# (not with pip --user, and not into system Python).
 
 pyudev>=0.24.0        # USB / udev device monitoring
 pystray>=0.19.4       # System tray icon + menu
