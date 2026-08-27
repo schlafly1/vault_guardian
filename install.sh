@@ -3,7 +3,8 @@
 # install.sh - one-command installer for Vault Guardian
 #
 # Installs system + Python dependencies, copies the app into
-# ~/.local/share/vault-guardian, installs a systemd *user* service, sets up
+# ~/.local/share/vault-guardian, creates a Python venv there (so pip never
+# touches the system interpreter), installs a systemd *user* service, sets up
 # a udev rule, and runs the first-time setup wizard.
 #
 # Run as your NORMAL user (NOT root). It will call sudo only for the few
@@ -16,6 +17,7 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP_DIR="${HOME}/.local/share/vault-guardian"
+VENV_DIR="${APP_DIR}/venv"
 BIN_DIR="${HOME}/.local/bin"
 SYSTEMD_USER_DIR="${HOME}/.config/systemd/user"
 UDEV_RULE="/etc/udev/rules.d/99-vault-guardian.rules"
@@ -63,27 +65,13 @@ install_system_deps() {
             gtk3 libappindicator-gtk3 apparmor || warn "some pacman pkgs missing"
     else
         warn "Unknown distro. Please install manually: gocryptfs, fuse, "
-        warn "python3-gi, GTK3, libappindicator3, apparmor-utils."
+        warn "python3-gi, GTK3, libappindicator3, apparmor-utils, python3-venv."
     fi
     ok "System dependencies step complete."
 }
 
 # ---------------------------------------------------------------------------
-# 2. Python dependencies (user install)
-# ---------------------------------------------------------------------------
-install_python_deps() {
-    info "Installing Python dependencies (pip --user)..."
-    python3 -m pip install --user --upgrade pip >/dev/null 2>&1 || true
-    if ! python3 -m pip install --user -r "${SRC_DIR}/requirements.txt"; then
-        warn "pip --user failed; retrying with --break-system-packages"
-        python3 -m pip install --user --break-system-packages \
-            -r "${SRC_DIR}/requirements.txt"
-    fi
-    ok "Python dependencies installed."
-}
-
-# ---------------------------------------------------------------------------
-# 3. Copy application files
+# 2. Copy application files
 # ---------------------------------------------------------------------------
 copy_app() {
     info "Installing application to ${APP_DIR}"
@@ -102,14 +90,14 @@ copy_app() {
                "${APP_DIR}/usb_monitor.py" \
                "${APP_DIR}/apparmor_manager.py"
 
-    # Convenience launchers on PATH.
+    # Convenience launchers on PATH. They always use the venv interpreter.
     cat > "${BIN_DIR}/vault-guardian" <<EOF
 #!/usr/bin/env bash
-exec python3 "${APP_DIR}/vault_guardian.py" "\$@"
+exec "${VENV_DIR}/bin/python" "${APP_DIR}/vault_guardian.py" "\$@"
 EOF
     cat > "${BIN_DIR}/vault-guardian-setup" <<EOF
 #!/usr/bin/env bash
-exec python3 "${APP_DIR}/setup_wizard.py" "\$@"
+exec "${VENV_DIR}/bin/python" "${APP_DIR}/setup_wizard.py" "\$@"
 EOF
     chmod 0755 "${BIN_DIR}/vault-guardian" "${BIN_DIR}/vault-guardian-setup"
     ok "Application files installed."
@@ -118,6 +106,24 @@ EOF
         *":${BIN_DIR}:"*) : ;;
         *) warn "Add ${BIN_DIR} to your PATH: echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.bashrc" ;;
     esac
+}
+
+# ---------------------------------------------------------------------------
+# 3. Python venv (never pip --user / --break-system-packages)
+# ---------------------------------------------------------------------------
+install_python_deps() {
+    info "Creating Python venv at ${VENV_DIR} (keeps system Python clean)..."
+    if ! python3 -m venv --help >/dev/null 2>&1; then
+        err "python3-venv is not available. On Ubuntu: sudo apt-get install python3-venv"
+        exit 1
+    fi
+    # --system-site-packages so apt-installed python3-gi / GTK bindings work.
+    python3 -m venv --system-site-packages "${VENV_DIR}"
+    local pip="${VENV_DIR}/bin/pip"
+    local py="${VENV_DIR}/bin/python"
+    "${py}" -m pip install --upgrade pip
+    "${pip}" install -r "${SRC_DIR}/requirements.txt"
+    ok "Python dependencies installed into the venv."
 }
 
 # ---------------------------------------------------------------------------
@@ -166,13 +172,14 @@ install_service() {
 # ---------------------------------------------------------------------------
 run_setup() {
     info "Launching first-time setup wizard..."
+    local py="${VENV_DIR}/bin/python"
     if [[ -t 0 ]]; then
-        python3 "${APP_DIR}/setup_wizard.py" || \
+        "${py}" "${APP_DIR}/setup_wizard.py" || \
             warn "Setup wizard exited early; run 'vault-guardian-setup' later."
     else
         warn "No interactive terminal detected. Run 'vault-guardian-setup' "
         warn "in a terminal to create your vault and register your USB key."
-        python3 "${APP_DIR}/setup_wizard.py" --non-interactive || true
+        "${py}" "${APP_DIR}/setup_wizard.py" --non-interactive || true
     fi
 }
 
@@ -182,8 +189,8 @@ main() {
     echo "  Vault Guardian installer"
     echo "=================================================="
     install_system_deps
-    install_python_deps
     copy_app
+    install_python_deps
     install_udev_rule
     install_service
     run_setup
@@ -196,6 +203,7 @@ main() {
     echo "  2. Look for the padlock icon in your system tray."
     echo "  3. Put files into your vault by opening ~/Vault while unlocked."
     echo
+    echo "Python packages live in ${VENV_DIR} (not system Python)."
     echo "Read the README for the security model and its honest limits."
 }
 

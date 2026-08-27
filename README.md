@@ -54,30 +54,42 @@ and can `sudo` once.)
 
 ---
 
-## Installation
+## Installation (Ubuntu)
 
-On the Linux machine you want to protect:
+Python packages go into a **venv** at `~/.local/share/vault-guardian/venv`.
+That keeps the system interpreter clean: no `pip install --user`, no
+breaking Ubuntu's PEP 668 externally-managed environment.
+
+GTK / `gi` still come from apt (`python3-gi` and the gir packages). The venv
+is created with `--system-site-packages` so `import gi` works for the tray
+icon.
+
+On the Ubuntu machine you want to protect:
 
 ```bash
+sudo apt-get update
+sudo apt-get install -y git
+git clone https://github.com/schlafly1/vault_guardian.git
 cd vault_guardian
 ./install.sh
 ```
 
+Run `./install.sh` as your **normal user**, not root. It uses `sudo` only for
+apt, the udev rule, and (optionally) AppArmor.
+
 The installer will:
 
-1. Install system deps: `gocryptfs`, `fuse`, `python3-gi`,
-   `gir1.2-appindicator3-0.1`, GTK3, `apparmor-utils` (via apt/dnf/pacman).
-2. `pip install --user` the Python deps: `pyudev`, `pystray`, `Pillow`,
-   `cryptography`, `fusepy`.
-3. Copy the app to `~/.local/share/vault-guardian/`.
+1. Install system deps via apt: `gocryptfs`, `fuse`, `python3`, `python3-venv`,
+   `python3-gi`, GTK3 / AppIndicator, `apparmor-utils`.
+2. Copy the app to `~/.local/share/vault-guardian/`.
+3. Create the venv there and pip-install `pyudev`, `pystray`, `Pillow`,
+   `cryptography`, `fusepy` **into that venv only**.
 4. Install launchers `vault-guardian` and `vault-guardian-setup` into
-   `~/.local/bin/`.
+   `~/.local/bin/` (they call the venv's Python).
 5. Install a udev rule (`/etc/udev/rules.d/99-vault-guardian.rules`).
-6. Install and enable a **systemd user service** so it starts at login.
+6. Install and enable a **systemd user service** whose `ExecStart` is the
+   venv interpreter.
 7. Run the **first-time setup wizard**.
-
-> Run `./install.sh` as your **normal user**, not root. It uses `sudo` only for
-> the apt install, the udev rule, and (optionally) AppArmor.
 
 To have it run even when you're not logged in graphically:
 
@@ -85,12 +97,23 @@ To have it run even when you're not logged in graphically:
 sudo loginctl enable-linger "$USER"
 ```
 
-### Requirements
-- A systemd-based Linux distro with FUSE (Ubuntu/Debian/Fedora/Arch all fine).
-- `gocryptfs` available in your package manager.
-- A desktop environment with a system tray / app-indicator area.
+### Manual venv (if you are not using install.sh)
 
----
+```bash
+sudo apt-get install -y python3 python3-venv python3-gi gir1.2-gtk-3.0 \
+    gir1.2-appindicator3-0.1 gocryptfs fuse apparmor-utils
+python3 -m venv --system-site-packages ~/.local/share/vault-guardian/venv
+~/.local/share/vault-guardian/venv/bin/pip install -r requirements.txt
+```
+
+Then point launchers and the systemd unit at
+`~/.local/share/vault-guardian/venv/bin/python`, same as `install.sh`.
+
+### Other distros
+
+`./install.sh` still tries dnf/pacman for system packages, then uses the same
+venv path. A systemd-based distro with FUSE and a system tray is required.
+`gocryptfs` must be available from your package manager.
 
 ## First-time setup (registering your USB key)
 
@@ -203,7 +226,7 @@ top of the FUSE guard. It needs `sudo` once when applied. See
 
 | File | Purpose |
 |------|---------|
-| `install.sh` | One-command installer |
+| `install.sh` | One-command installer (Ubuntu-first; Python deps go in a venv) |
 | `setup_wizard.py` | First-time setup + config/crypto helpers |
 | `vault_manager.py` | gocryptfs mount / unmount (safe subprocess) |
 | `usb_monitor.py` | udev USB add/remove detection by serial hash |
@@ -211,8 +234,11 @@ top of the FUSE guard. It needs `sudo` once when applied. See
 | `apparmor_manager.py` | Optional kernel AppArmor profile generator |
 | `tray_app.py` | System-tray UI + orchestration |
 | `vault_guardian.py` | Entry point launched by systemd/CLI |
-| `vault-guardian.service` | systemd **user** service unit |
-| `requirements.txt` | Python dependencies |
+| `vault-guardian.service` | systemd **user** service unit (ExecStart = venv Python) |
+| `requirements.txt` | Python dependencies (installed into the venv) |
+
+The venv itself is created at install time under
+`~/.local/share/vault-guardian/venv` and is not part of the git repo.
 
 ---
 
@@ -220,8 +246,9 @@ top of the FUSE guard. It needs `sudo` once when applied. See
 
 **Tray icon doesn't appear.**
 - Ensure your desktop shows app-indicators. On GNOME install the
-  *AppIndicator and KStatusNotifierItem* extension. Verify GTK/appindicator:
-  `python3 -c "import gi; gi.require_version('Gtk','3.0')"`.
+  *AppIndicator and KStatusNotifierItem* extension. Verify GTK/appindicator
+  with the venv Python:
+  `~/.local/share/vault-guardian/venv/bin/python -c "import gi; gi.require_version('Gtk','3.0')"`.
 - Check the service: `systemctl --user status vault-guardian` and
   `journalctl --user -u vault-guardian`.
 
@@ -242,9 +269,15 @@ top of the FUSE guard. It needs `sudo` once when applied. See
 - A stale mount. Run: `fusermount -u ~/Vault ; fusermount -u ~/.vault-plain`
   then unlock again.
 
-**pip install fails with "externally managed environment".**
-- The installer retries with `--break-system-packages`. You can also use a
-  virtualenv and point the service `ExecStart` at that interpreter.
+**pip fails with an externally managed environment.**
+- The installer no longer uses user-site pip. If you see this, you are not
+  using the venv. Use `~/.local/share/vault-guardian/venv/bin/pip`, or re-run
+  `./install.sh`.
+
+**`import gi` fails inside the venv.**
+- Install the system packages: `sudo apt-get install python3-gi gir1.2-gtk-3.0 gir1.2-appindicator3-0.1`.
+- Recreate the venv with system site packages, then pip-install requirements
+  into `~/.local/share/vault-guardian/venv`.
 
 **FUSE "allow_other" errors.** The core setup does not require `allow_other`
 because the guard runs as you. If you customize it and hit this, add
@@ -263,6 +296,6 @@ sudo rm -f /etc/udev/rules.d/99-vault-guardian.rules
 sudo rm -f /etc/apparmor.d/vault-guardian   # if you used AppArmor
 ```
 
-Your encrypted data in `~/.vault-encrypted` is left untouched — delete it
+`rm -rf ~/.local/share/vault-guardian` also removes the venv. Your encrypted data in `~/.vault-encrypted` is left untouched — delete it
 yourself if you no longer need it (make sure you can decrypt it elsewhere
 first if you want to keep the contents).
