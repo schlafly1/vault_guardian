@@ -1,0 +1,19 @@
+[Unit]
+Description=Vault Guardian - USB-gated encrypted vault with per-app allowlist
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+# %h expands to the user's home directory.
+ExecStart=%h/.local/share/vault-guardian/vault_guardian.py
+Restart=on-failure
+RestartSec=3
+# Lock the vault cleanly when the service is stopped.
+KillSignal=SIGTERM
+TimeoutStopSec=10
+# Make sure the tray can reach the user's display/session bus.
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target
