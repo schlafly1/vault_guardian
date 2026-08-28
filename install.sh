@@ -35,27 +35,111 @@ fi
 # ---------------------------------------------------------------------------
 # 1. System dependencies
 # ---------------------------------------------------------------------------
+# Jetson / L4T: a naive `apt-get update && apt-get install gtk/fuse/...` is a
+# well-known way to remove nvidia-l4t-x11 / nvidia-l4t-3d-core and kill the
+# display. Detect that board, hold every installed nvidia-l4t-* package, never
+# upgrade, never install recommends, and skip anything whose dry-run would
+# touch the NVIDIA stack.
+is_tegra() {
+    [[ -e /etc/nv_tegra_release ]] && return 0
+    [[ -e /usr/lib/aarch64-linux-gnu/tegra ]] && return 0
+    grep -qi tegra /proc/device-tree/compatible 2>/dev/null && return 0
+    return 1
+}
+
+pkg_installed() {
+    dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q "install ok installed"
+}
+
+tegra_pkgs() {
+    dpkg-query -W -f='${Package}\n' 2>/dev/null | grep -E '^nvidia-l4t-' || true
+}
+
+hold_tegra_stack() {
+    local pkgs
+    mapfile -t pkgs < <(tegra_pkgs)
+    if ((${#pkgs[@]} == 0)); then
+        return 0
+    fi
+    info "NVIDIA L4T detected: holding ${#pkgs[@]} nvidia-l4t packages so apt cannot change the display stack"
+    sudo apt-mark hold "${pkgs[@]}" >/dev/null || warn "apt-mark hold failed (continuing)"
+}
+
+# True if a simulated install would install/remove/upgrade any nvidia-l4t-* pkg.
+apt_would_touch_tegra() {
+    local sim
+    sim="$(apt-get -s -o Debug::NoLocking=1 install --no-install-recommends --no-upgrade "$1" 2>/dev/null || true)"
+    echo "$sim" | grep -qE '(^Inst |^Remv |^Purg )nvidia-l4t-'
+}
+
+safe_apt_install() {
+    # $1=package  $2=1 if optional
+    local p="$1" optional="${2:-0}"
+    if pkg_installed "$p"; then
+        return 0
+    fi
+    if is_tegra && apt_would_touch_tegra "$p"; then
+        warn "Skipping $p: apt would change nvidia-l4t display/kernel packages"
+        return 1
+    fi
+    local extra=(--no-install-recommends)
+    if is_tegra; then
+        extra+=(--no-upgrade)
+    fi
+    if sudo apt-get install -y "${extra[@]}" "$p"; then
+        return 0
+    fi
+    if [[ "$optional" == 1 ]]; then
+        warn "could not install optional $p (continuing)"
+    else
+        warn "could not install $p"
+    fi
+    return 1
+}
+
+gtk_already_ok() {
+    python3 -c 'import gi; gi.require_version("Gtk", "3.0"); from gi.repository import Gtk' 2>/dev/null
+}
+
 install_system_deps() {
     info "Installing system dependencies (needs sudo)..."
-    local pkgs=(
-        gocryptfs
-        fuse
-        python3
-        python3-pip
-        python3-venv
-        python3-gi
-        gir1.2-appindicator3-0.1
-        gir1.2-gtk-3.0
-        apparmor-utils
-    )
     if command -v apt-get >/dev/null 2>&1; then
+        if is_tegra; then
+            hold_tegra_stack
+            info "Jetson/L4T: will not upgrade existing packages or pull recommends"
+        fi
         sudo apt-get update -y || warn "apt update failed (continuing)"
-        # Install what we can; don't abort if one optional pkg is missing.
-        for p in "${pkgs[@]}"; do
-            if ! dpkg -s "$p" >/dev/null 2>&1; then
-                sudo apt-get install -y "$p" || warn "could not install $p"
-            fi
-        done
+
+        # Required for the vault itself.
+        safe_apt_install gocryptfs 0 || true
+        # Prefer an already-present FUSE userspace (fuse3 on Ubuntu 22.04+).
+        if ! command -v fusermount >/dev/null 2>&1 && ! command -v fusermount3 >/dev/null 2>&1; then
+            safe_apt_install fuse 0 || safe_apt_install fuse3 0 || true
+        fi
+        safe_apt_install python3 0 || true
+        safe_apt_install python3-pip 0 || true
+        safe_apt_install python3-venv 0 || true
+
+        # GTK / GI are only needed for the tray. Skip if they already import,
+        # and treat them as optional so a missing appindicator cannot pull Mesa
+        # over NVIDIA's GL stack.
+        if gtk_already_ok; then
+            ok "GTK/GI already usable; not installing desktop packages"
+        else
+            safe_apt_install python3-gi 1 || true
+            safe_apt_install gir1.2-gtk-3.0 1 || true
+        fi
+        # AppIndicator is optional; Ubuntu 22.04+ often has ayatana instead.
+        safe_apt_install gir1.2-ayatanaappindicator3-0.1 1 || \
+            safe_apt_install gir1.2-appindicator3-0.1 1 || true
+
+        # AppArmor is optional hardening, not required for the vault.
+        # Never install it automatically on L4T.
+        if ! is_tegra; then
+            safe_apt_install apparmor-utils 1 || true
+        else
+            info "Skipping apparmor-utils on Jetson (optional; not needed for the vault)"
+        fi
     elif command -v dnf >/dev/null 2>&1; then
         sudo dnf install -y gocryptfs fuse python3-pip python3-gobject \
             gtk3 libappindicator-gtk3 apparmor-utils || \
@@ -65,7 +149,7 @@ install_system_deps() {
             gtk3 libappindicator-gtk3 apparmor || warn "some pacman pkgs missing"
     else
         warn "Unknown distro. Please install manually: gocryptfs, fuse, "
-        warn "python3-gi, GTK3, libappindicator3, apparmor-utils, python3-venv."
+        warn "python3-gi, GTK3, libappindicator3, python3-venv."
     fi
     ok "System dependencies step complete."
 }
@@ -142,7 +226,10 @@ ACTION=="add|remove", SUBSYSTEM=="usb", TAG+="vault_guardian"
 EOF
     if sudo install -m 0644 "${tmp}" "${UDEV_RULE}"; then
         sudo udevadm control --reload-rules || true
-        sudo udevadm trigger || true
+        # Never `udevadm trigger` with no filter: that replays EVERY device,
+        # including DRM/display on Jetson, and can drop the video output.
+        sudo udevadm trigger --subsystem-match=usb --action=add || true
+        sudo udevadm trigger --subsystem-match=block --action=add || true
         ok "udev rule installed."
     else
         warn "Could not install udev rule; USB monitoring still works via "

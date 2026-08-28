@@ -82,10 +82,16 @@ cd vault_guardian
 Run `./install.sh` as your **normal user**, not root. It uses `sudo` only for
 apt, the udev rule, and (optionally) AppArmor.
 
+On NVIDIA Jetson (L4T) the installer holds every `nvidia-l4t-*` package,
+refuses to upgrade or pull recommends, skips any apt action that would change
+the display stack, and only udev-triggers USB/block. Older versions did
+none of that, which could kill HDMI/desktop output.
+
 The installer will:
 
-1. Install system deps via apt: `gocryptfs`, `fuse`, `python3`, `python3-venv`,
-   `python3-gi`, GTK3 / AppIndicator, `apparmor-utils`.
+1. Install missing system deps via apt: `gocryptfs`, FUSE (if `fusermount` is
+   absent), `python3` / `python3-venv`. GTK/AppIndicator only if they are not
+   already importable. `apparmor-utils` is skipped on Jetson.
 2. Copy the app to `~/.local/share/vault-guardian/`.
 3. Create the venv there and pip-install `pyudev`, `pystray`, `Pillow`,
    `cryptography`, `fusepy` **into that venv only**.
@@ -286,6 +292,16 @@ The venv itself is created at install time under
 - This machine has unprivileged user namespaces disabled. Vault Guardian
   will not fall back to a host-visible plaintext mount. On Ubuntu check
   `sysctl kernel.unprivileged_userns_clone` (should be 1).
+
+**NVIDIA Jetson: display died after install (black HDMI, no desktop).**
+- An older installer ran `apt-get install` of GTK/FUSE/AppArmor after
+  `apt-get update`, which on L4T can remove `nvidia-l4t-x11` /
+  `nvidia-l4t-3d-core`. It also ran an unfiltered `udevadm trigger`.
+  Recover over SSH (this is what NVIDIA documents):
+  `sudo apt install --reinstall nvidia-l4t-x11 nvidia-l4t-3d-core`
+  Current `install.sh` holds all `nvidia-l4t-*` packages, uses
+  `--no-upgrade --no-install-recommends`, skips any package whose dry-run
+  would touch that stack, and only udev-triggers USB/block.
 
 **pip fails with an externally managed environment.**
 - The installer no longer uses user-site pip. If you see this, you are not
