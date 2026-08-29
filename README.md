@@ -253,7 +253,7 @@ top of the FUSE guard. It needs `sudo` once when applied. See
 | `apparmor_manager.py` | Optional kernel AppArmor profile generator |
 | `tray_app.py` | System-tray UI + orchestration |
 | `vault_guardian.py` | Entry point launched by systemd/CLI |
-| `vault-guardian.service` | systemd **user** service unit (ExecStart = venv Python) |
+| `vault-guardian.service` | systemd **user** service unit (`ExecStart` = `vault-guardian` wrapper) |
 | `requirements.txt` | Python dependencies (installed into the venv) |
 
 The venv itself is created at install time under
@@ -264,12 +264,21 @@ The venv itself is created at install time under
 ## Troubleshooting
 
 **Tray icon doesn't appear.**
-- Ensure your desktop shows app-indicators. On GNOME install the
-  *AppIndicator and KStatusNotifierItem* extension. Verify GTK/appindicator
-  with the venv Python:
-  `~/.local/share/vault-guardian/venv/bin/python -c "import gi; gi.require_version('Gtk','3.0')"`.
-- Check the service: `systemctl --user status vault-guardian` and
-  `journalctl --user -u vault-guardian`.
+- The USB lock still works without an icon. Confirm the service is active:
+  `systemctl --user status vault-guardian`. If it is `inactive (dead)` with
+  `Xlib.error.DisplayNameError: Bad display name ""` in the journal, you are
+  on a build that crashed without `DISPLAY`. Pull `main` and re-run
+  `./install.sh` — the daemon now stays up headless and infers `:0` /
+  `wayland-0` when a session exists.
+- On GNOME, tray icons need the *AppIndicator and KStatusNotifierItem*
+  extension. Ubuntu 24.04 / Jetson often has no indicator area otherwise.
+- Verify GTK: `~/.local/share/vault-guardian/venv/bin/python -c "import gi; gi.require_version('Gtk','3.0')"`.
+- `journalctl --user -u vault-guardian -n 50`
+
+**Unplugging the USB key does nothing.**
+- The monitor is the same process as the tray. If the service is dead, unplug
+  cannot lock. `systemctl --user restart vault-guardian` then
+  `systemctl --user status vault-guardian` should show `active (running)`.
 
 **`~/Vault` is empty even with the key inserted.**
 - Confirm the key is the registered one: tray → *Change USB Key…* re-selects.

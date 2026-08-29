@@ -177,6 +177,19 @@ copy_app() {
     # Convenience launchers on PATH. They always use the venv interpreter.
     cat > "${BIN_DIR}/vault-guardian" <<EOF
 #!/usr/bin/env bash
+# systemd --user often has empty DISPLAY. Infer a live session so the tray
+# can start; the Python process still runs headless if none exists.
+if [[ -z "\${DISPLAY:-}" && -z "\${WAYLAND_DISPLAY:-}" ]]; then
+  runtime="\${XDG_RUNTIME_DIR:-/run/user/\$(id -u)}"
+  [[ -S /tmp/.X11-unix/X0 ]] && export DISPLAY=:0
+  [[ -S /tmp/.X11-unix/X1 && -z "\${DISPLAY:-}" ]] && export DISPLAY=:1
+  for w in wayland-0 wayland-1 wayland-2; do
+    if [[ -S "\$runtime/\$w" ]]; then
+      export WAYLAND_DISPLAY="\$w"
+      break
+    fi
+  done
+fi
 exec "${VENV_DIR}/bin/python" "${APP_DIR}/vault_guardian.py" "\$@"
 EOF
     cat > "${BIN_DIR}/vault-guardian-setup" <<EOF
@@ -247,11 +260,13 @@ install_service() {
     install -m 0644 "${SRC_DIR}/vault-guardian.service" \
         "${SYSTEMD_USER_DIR}/vault-guardian.service"
     systemctl --user daemon-reload || warn "systemctl --user daemon-reload failed"
+    systemctl --user reset-failed vault-guardian.service 2>/dev/null || true
     systemctl --user enable vault-guardian.service || \
         warn "could not enable service (no user systemd session?)"
-    ok "Service installed. It will start on next login."
-    info "Tip: enable lingering so it runs without an active login:"
-    info "     sudo loginctl enable-linger ${USER}"
+    systemctl --user restart vault-guardian.service || \
+        warn "could not start service yet; it will start on next login"
+    ok "Service installed."
+    info "USB unplug-to-lock works even without a tray icon (headless)."
 }
 
 # ---------------------------------------------------------------------------
