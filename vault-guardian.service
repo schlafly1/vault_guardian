@@ -2,18 +2,20 @@
 Description=Vault Guardian - USB-gated encrypted vault with per-app allowlist
 After=graphical-session.target
 PartOf=graphical-session.target
+# Don't restart-storm if the tray backend is missing; USB monitor stays up
+# once the process no longer exits on an empty DISPLAY.
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
-# %h expands to the user's home directory. Use the venv interpreter so pip
-# packages never need to live on the system Python.
-ExecStart=%h/.local/share/vault-guardian/venv/bin/python %h/.local/share/vault-guardian/vault_guardian.py
+# Use the wrapper so DISPLAY/WAYLAND_DISPLAY can be inferred when systemd
+# --user starts us with an empty environment (typical with linger).
+ExecStart=%h/.local/bin/vault-guardian
 Restart=on-failure
-RestartSec=3
-# Lock the vault cleanly when the service is stopped.
+RestartSec=5
 KillSignal=SIGTERM
 TimeoutStopSec=10
-# Make sure the tray can reach the user's display/session bus.
 Environment=PYTHONUNBUFFERED=1
 
 [Install]

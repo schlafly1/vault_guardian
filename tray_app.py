@@ -195,6 +195,28 @@ def _make_icon(locked: bool):
     return img
 
 
+
+def _purge_pystray() -> None:
+    for name in list(sys.modules):
+        if name == "pystray" or name.startswith("pystray."):
+            del sys.modules[name]
+
+
+def _ensure_display_env() -> None:
+    """systemd --user often starts with DISPLAY unset. Infer a session."""
+    if os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
+        return
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    for w in ("wayland-0", "wayland-1", "wayland-2"):
+        if os.path.exists(os.path.join(runtime, w)):
+            os.environ["WAYLAND_DISPLAY"] = w
+            break
+    for sock, display in (("/tmp/.X11-unix/X0", ":0"),
+                          ("/tmp/.X11-unix/X1", ":1")):
+        if os.path.exists(sock):
+            os.environ.setdefault("DISPLAY", display)
+            break
+
 # ---------------------------------------------------------------------------
 # Core controller
 # ---------------------------------------------------------------------------
@@ -537,8 +559,31 @@ class VaultGuardian:
         show_message("Access Log", f"Log file: {cfgmod.LOG_PATH}")
 
     # -- lifecycle ---------------------------------------------------------
+    def _run_tray(self) -> bool:
+        """Blocking tray loop. Returns False if no backend could start."""
+        _ensure_display_env()
+        # AppIndicator/GTK before Xlib: empty DISPLAY makes the xorg backend
+        # raise DisplayNameError and kill the process (and the USB monitor).
+        for backend in ("appindicator", "gtk", "xorg"):
+            os.environ["PYSTRAY_BACKEND"] = backend
+            _purge_pystray()
+            try:
+                import pystray
+                self.icon = pystray.Icon(
+                    "vault-guardian",
+                    icon=_make_icon(locked=not self.is_open),
+                    title="Vault Guardian",
+                    menu=self._build_menu(),
+                )
+                log_event("INFO", f"tray icon started (backend={backend})")
+                self.icon.run()
+                return True
+            except Exception as e:
+                log_event("WARN", f"tray backend {backend} failed: {e}")
+                self.icon = None
+        return False
+
     def run(self) -> None:
-        import pystray
         log_event("INFO", "Vault Guardian starting")
 
         # Safety: ensure we start LOCKED (clear any stale mounts).
@@ -547,20 +592,24 @@ class VaultGuardian:
         except Exception:
             pass
 
+        # USB monitor MUST start even if the tray cannot. Unplug-to-lock is
+        # the whole point; a missing DISPLAY must not take it down.
         self._start_monitor()
         self._start_suspend_watch()
 
-        self.icon = pystray.Icon(
-            "vault-guardian",
-            icon=_make_icon(locked=not self.is_open),
-            title="Vault Guardian",
-            menu=self._build_menu(),
-        )
-        # Handle termination signals to lock before exit.
         signal.signal(signal.SIGTERM, lambda *a: self.shutdown())
         signal.signal(signal.SIGINT, lambda *a: self.shutdown())
 
-        self.icon.run()
+        _ensure_display_env()
+        if os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
+            if self._run_tray():
+                return
+            log_event("WARN", "no tray icon available; USB lock is still active")
+        else:
+            log_event("INFO", "no display; running headless (USB lock still active)")
+
+        while not self._stop.is_set():
+            self._stop.wait(timeout=1.0)
 
     def shutdown(self, *_a) -> None:
         log_event("INFO", "Vault Guardian shutting down - locking vault")
