@@ -1,108 +1,129 @@
 # Vault Guardian
 
-**A USB-gated, per-app encrypted vault for Linux — designed to keep an AI
+**A USB-gated, Unix-DAC encrypted vault for Linux — designed to keep an AI
 agent (or any other process) running as *you* from reading your sensitive
 files.**
 
 Your secrets live in an encrypted folder that is only decrypted while a
 specific USB key you registered is plugged in. Even while it is unlocked,
-**only apps you explicitly allow** (LibreOffice, your browser, your editor…)
-can read the files. Pull the USB key — or click **Lock Now** in the tray —
-and the plaintext instantly disappears.
+**your own login user cannot read `~/Vault`**. Only apps you launch through
+the sgid helper `vault-exec` inherit group `vaultguard` and can open the
+files. Pull the USB key — or click **Lock Now** in the tray — and the
+plaintext instantly disappears.
+
+This is a **DAC + sgid** design. It does **not** use unprivileged user
+namespaces, nested FUSE, or fusepy. Those were unreliable on NVIDIA Jetson
+Orin Nano (L4T).
 
 ---
 
 ## Why this exists
 
 If an AI agent runs with the *same user account* as you, it has, in principle,
-the same file permissions you do. Ordinary file permissions can't help. Vault
-Guardian raises the bar with two independent gates:
+the same file permissions you do. Ordinary file mode bits on files you own
+cannot help, because the agent *is* you.
+
+Vault Guardian raises the bar with two independent gates:
 
 1. **Possession gate (USB key):** the vault is encrypted with `gocryptfs`
    (AES-256-GCM). It is only mounted while your registered USB device is
-   physically present. No key → the files are ciphertext no one can read.
-2. **Identity gate (app allowlist):** even when mounted, access goes through a
-   userspace **FUSE guard** that inspects *which program* is making each
-   request (`/proc/<pid>/exe`). Only allow-listed apps get through; everything
-   else — including a Python/bash/xdotool-driven agent — gets `Permission
-   denied`.
+   physically present. No key -> the files are ciphertext no one can read.
+2. **Identity gate (Unix DAC + sgid helper):** the plaintext is mounted as
+   system user `vaultguard`, mode `0750`, group `vaultguard`. **Your login
+   user is never added to that group.** Human apps get the group *only* by
+   being launched through `/usr/local/bin/vault-exec` (owner `root:vaultguard`,
+   mode `2755` sgid). python / cat / Cursor running as you get `EACCES`.
 
-Both gates run **entirely as your normal user. No root required** for the core
-protection. (An optional AppArmor layer adds kernel enforcement if you want it
-and can `sudo` once.)
-
----
-
-## How it works (plain English)
-
-```
-   ~/.vault-encrypted/     encrypted files on disk (safe at rest)
-          │  gocryptfs decrypts inside the guard's private mount namespace
-          ▼
-   private tmpfs           plaintext, visible only to the guard process
-          │  FUSE guard checks the *calling* executable (no parent-walk)
-          ▼
-   ~/Vault/                what you and your allowed apps actually open
-```
-
-The plaintext directory is *not* `~/.vault-plain` on the host. Older versions
-left decrypted files there at mode 700, which any same-user process could
-read. Unlock now fails closed if a private mount namespace cannot be created
-(for example if unprivileged user namespaces are disabled).
-
-- Plug in your registered USB key → the tray icon turns **green** and `~/Vault`
-  fills with your files (visible only to allowed apps).
-- Remove the key (or click **Lock Now**, or the machine suspends) → the tray
-  icon turns **red**, `~/Vault` is unmounted, and the plaintext is gone.
-- An agent that opens `~/Vault/secret.txt` with Python or a shell is denied,
-  because its executable is `python3`/`bash`, not an allowed app.
+The privileged bits are a **one-time sudo**. Day-to-day unlock/lock uses
+`sudo -n -u vaultguard` on two no-argument wrappers (`mount` / `unmount`).
 
 ---
 
-## Installation (Ubuntu)
+## How it works
+
+```
+   ~/.vault-encrypted/     ciphertext (roger-owned; ACL lets vaultguard read)
+          |  sudo -n -u vaultguard /usr/local/libexec/vault-guardian/mount
+          v
+   ~/Vault/                plaintext, vaultguard:vaultguard 0750
+          |  login user: EACCES
+          |  vault-exec (sgid vaultguard) -> allowed app: group access
+          v
+   /usr/bin/evince etc.    only binaries listed in /etc/vault-guardian/allowed-apps
+```
+
+- Plug in your registered USB key -> tray icon turns **green**, `gocryptfs`
+  mounts `~/Vault` as `vaultguard`.
+- `ls ~/Vault` as yourself fails with Permission denied. **That is success.**
+- Open files with the tray action **Open with allowed app...** (runs
+  `/usr/local/bin/vault-exec <resolved-binary>` with no shell).
+- Remove the key (or **Lock Now**, or suspend) -> tray turns **red**,
+  `fusermount3 -u` as `vaultguard`. Unmount is enough: gocryptfs *is* the
+  FUSE server.
+- Existing `~/.vault-encrypted` is **kept**. Nothing here wipes ciphertext.
+
+---
+
+## Installation (Ubuntu / Jetson)
 
 Python packages go into a **venv** at `~/.local/share/vault-guardian/venv`.
-That keeps the system interpreter clean: no `pip install --user`, no
-breaking Ubuntu's PEP 668 externally-managed environment.
-
-GTK / `gi` still come from apt (`python3-gi` and the gir packages). The venv
-is created with `--system-site-packages` so `import gi` works for the tray
-icon.
-
-On the Ubuntu machine you want to protect:
 
 ```bash
-sudo apt-get update
-sudo apt-get install -y git
-git clone https://github.com/schlafly1/vault_guardian.git
-cd vault_guardian
 ./install.sh
+sudo ./install-privileged.sh
 ```
 
-Run `./install.sh` as your **normal user**, not root. It uses `sudo` only for
-apt, the udev rule, and (optionally) AppArmor.
+Run `./install.sh` as your **normal user**. Then run the privileged installer
+**once** with sudo. It will **not** add you to group `vaultguard`.
 
-On NVIDIA Jetson (L4T) the installer holds every `nvidia-l4t-*` package,
-refuses to upgrade or pull recommends, skips any apt action that would change
-the display stack, and only udev-triggers USB/block. Older versions did
-none of that, which could kill HDMI/desktop output.
+On NVIDIA Jetson (L4T) both scripts hold every `nvidia-l4t-*` package,
+refuse to upgrade or pull recommends, skip any apt action that would change
+the display stack, and only udev-trigger USB/block. Do not `apt-get upgrade`
+and do not touch `nvidia-l4t`.
 
-The installer will:
+### What `./install.sh` does
 
-1. Install missing system deps via apt: `gocryptfs`, FUSE (if `fusermount` is
-   absent), `python3` / `python3-venv`. GTK/AppIndicator only if they are not
-   already importable. `apparmor-utils` is skipped on Jetson.
-2. Copy the app to `~/.local/share/vault-guardian/`.
-3. Create the venv there and pip-install `pyudev`, `pystray`, `Pillow`,
-   `cryptography`, `fusepy` **into that venv only**.
-4. Install launchers `vault-guardian` and `vault-guardian-setup` into
-   `~/.local/bin/` (they call the venv's Python).
+1. Jetson-safe apt: `gocryptfs`, fuse3/`fusermount3`, `python3` / `python3-venv`.
+   GTK/AppIndicator only if they are not already importable.
+   Does **not** install `libfuse2`. Skips `apparmor-utils` on tegra.
+2. Copy the app to `~/.local/share/vault-guardian/` (including `vault-exec.c`
+   and `install-privileged.sh`).
+3. Create the venv and pip-install `pyudev`, `pystray`, `Pillow`,
+   `cryptography` **into that venv only**.
+4. Install launchers `vault-guardian` and `vault-guardian-setup`.
 5. Install a udev rule (`/etc/udev/rules.d/99-vault-guardian.rules`).
-6. Install and enable a **systemd user service** whose `ExecStart` is the
-   venv interpreter.
-7. Run the **first-time setup wizard**.
+6. Enable a systemd **user** service.
+7. Run the first-time setup wizard.
+8. Print: now run `sudo ./install-privileged.sh`.
 
-To have it run even when you're not logged in graphically:
+### What `sudo ./install-privileged.sh` does (one-time)
+
+1. `groupadd --system vaultguard` and `useradd --system` with nologin.
+   **Never** `usermod -aG vaultguard` the login user.
+2. Ensure `user_allow_other` in `/etc/fuse.conf`.
+3. `mkdir -p ~/Vault`; `chown vaultguard:vaultguard`; `chmod 0750`.
+4. ACL `u:vaultguard:rx` on `~/.vault-encrypted` (and default ACL). If `setfacl`
+   is missing, falls back to `chmod 0750` with group `vaultguard`.
+5. `/etc/sudoers.d/vault-guardian`: **only** the login user, NOPASSWD, absolute
+   paths, argument-filtered:
+   `gocryptfs -q -allow_other <cipher> <mount>` and
+   `fusermount3 -u` / `-u -z` (and `fusermount` if present).
+6. `gcc -O2 -Wall -Werror vault-exec.c -o /usr/local/bin/vault-exec`;
+   `chown root:vaultguard`; `chmod 2755`. **Not** sgid Python.
+7. Write `/etc/vault-guardian/allowed-apps` from config (resolved with
+   `command -v` / `realpath`).
+8. Install `gcc` / `acl` only if missing, using the same Jetson-safe apt
+   (`--no-upgrade --no-install-recommends`, hold `nvidia-l4t-*`).
+
+To rewrite the allowlist later:
+
+```bash
+sudo ./install-privileged.sh --sync-allowlist
+```
+
+(`sudo ./install.sh --privileged` is an alias for the same script.)
+
+To have the tray run even when you are not logged in graphically:
 
 ```bash
 sudo loginctl enable-linger "$USER"
@@ -112,40 +133,27 @@ sudo loginctl enable-linger "$USER"
 
 ```bash
 sudo apt-get install -y python3 python3-venv python3-gi gir1.2-gtk-3.0 \
-    gir1.2-appindicator3-0.1 gocryptfs fuse apparmor-utils
+    gir1.2-appindicator3-0.1 gocryptfs fuse3 gcc acl
 python3 -m venv --system-site-packages ~/.local/share/vault-guardian/venv
 ~/.local/share/vault-guardian/venv/bin/pip install -r requirements.txt
 ```
 
-Then point launchers and the systemd unit at
-`~/.local/share/vault-guardian/venv/bin/python`, same as `install.sh`.
+Then run `sudo ./install-privileged.sh`.
 
-### Other distros
-
-`./install.sh` still tries dnf/pacman for system packages, then uses the same
-venv path. A systemd-based distro with FUSE and a system tray is required.
-`gocryptfs` must be available from your package manager.
+---
 
 ## First-time setup (registering your USB key)
 
 The wizard (`vault-guardian-setup`) walks you through:
 
-1. **Vault location & password.** Creates `~/.vault-encrypted` and asks for a
-   strong password (used to derive the AES key).
-2. **Pick your USB key.** It lists plugged-in USB devices that expose a serial.
-   Choose the stick or security key you want to use.
-   - Only a **SHA256 hash of the device serial** is stored — never the raw
-     serial, and never the vendor/product ID (which any identical model would
-     share and is trivially spoofed).
-3. **Password prompt on every unlock.** Auto-unlock is not offered. A blob in
-   `~/.config/vault-guardian/config.json` is readable by any same-user process
-   (including an AI agent), so storing a decryptable copy of the vault password
-   there would defeat the point. Existing blobs are ignored and wiped.
-4. **Allowed apps.** Defaults to
-   `libreoffice, firefox, evince, gedit, kate`. Add your own. `code` is
-   intentionally not a default: the allowlist checks only the calling process,
-   so a terminal or agent spawned *from* an editor is denied unless that
-   child binary is itself listed.
+1. **Vault location and password.** Creates `~/.vault-encrypted` (or keeps it).
+   Password is asked at every unlock — never stored.
+2. **Pick your USB key.** Only a **SHA256 hash of the device serial** is stored.
+3. **Allowed apps.** Defaults to
+   `libreoffice, firefox, evince, gedit, kate` — resolved to absolute paths.
+   No `code`, no `bash`, no `python`.
+4. Tells you to run `sudo ./install-privileged.sh`. After that,
+   `ls ~/Vault` as yourself will `EACCES` while unlocked. That is success.
 
 Re-run any time with:
 
@@ -153,7 +161,7 @@ Re-run any time with:
 vault-guardian-setup
 ```
 
-You can also change the USB key later from the tray menu → **Change USB Key…**
+You can also change the USB key later from the tray menu -> **Change USB Key...**
 
 ---
 
@@ -163,80 +171,75 @@ Look for the padlock icon in your system tray:
 
 | Menu item | What it does |
 |-----------|--------------|
-| 🔒/🔓 status line | Shows whether the vault is Locked or Open |
-| **Unlock Now** | Manually mount the vault (asks for password unless auto-unlock) |
-| **Lock Now** | Immediately unmount — plaintext disappears |
-| **Allowed Apps…** | Add/remove which programs may read the vault |
-| **Change USB Key…** | Register a different USB device as your key |
-| **View Access Log** | Opens the log of every allow/deny decision |
+| status line | Shows whether the vault is Locked or Open |
+| **Unlock Now** | Password dialog, then `sudo -n -u vaultguard gocryptfs` |
+| **Lock Now** | `sudo -n -u vaultguard fusermount3 -u` (then `-u -z`) |
+| **Open with allowed app...** | `vault-exec <resolved-binary>` (no shell) |
+| **Allowed Apps...** | Edit the list; tries to update `/etc/vault-guardian/allowed-apps` |
+| **Change USB Key...** | Register a different USB device |
+| **View Access Log** | Opens `~/.local/share/vault-guardian/access.log` |
 | **Quit** | Locks the vault and exits |
 
+USB unplug-to-lock works even without a tray icon (headless).
+
+If saving allowed apps cannot write the system file, a copy is stored at
+`~/.config/vault-guardian/allowed-apps` and you need:
+
+```bash
+sudo ./install-privileged.sh --sync-allowlist
+```
+
 ### Adding files to the vault
-1. Unlock the vault (plug in your key).
-2. Open `~/Vault` in your file manager or an allowed app.
-3. Copy files in / edit them as normal. They're transparently encrypted into
-   `~/.vault-encrypted`.
-4. Lock when done. Only ciphertext remains on disk.
 
-> Tip: because the file manager itself must read `~/Vault` to show it, add your
-> file manager (e.g. `nautilus`, `dolphin`, `nemo`, `thunar`) to the allowed
-> apps if you want to browse the vault graphically.
+1. Unlock (plug in the key, enter the password).
+2. Tray -> **Open with allowed app...** (file manager or editor on the allowlist).
+3. Edit as normal. Data is encrypted into `~/.vault-encrypted`.
+4. Lock when done (unplug). Only ciphertext remains on disk.
 
-### Access log
-Every decision is recorded at
-`~/.local/share/vault-guardian/access.log`, e.g.:
+Do not `chmod ~/Vault` back to yourself. It must stay `vaultguard:vaultguard 0750`.
 
-```
-2026-08-26 10:22:01 [OPEN] vault open at /home/you/Vault
-[ALLOW] read /secret.txt pid=4812 exe=/usr/lib/libreoffice/program/soffice.bin
-[DENY] open /secret.txt pid=5501 exe=/usr/bin/python3
+If an allowed app cannot write files that were created before the DAC
+switch (they may still be mode `0644`), one-time as root after unlock:
+
+```bash
+sudo -u vaultguard chmod -R g+rwX ~/Vault
 ```
 
-The `[DENY]` lines are exactly the AI-agent access attempts you wanted to see.
+New files use umask `007` (group-readable, not world-readable). Old files are remapped with gocryptfs `-force_owner` so they are not owned by your login uid.
 
 ---
 
 ## Security model — and its honest limits
 
 **What this stops well:**
-- An AI agent (or any process) reading your files via Python, shell, `cat`,
-  `scp`, a scripting tool, or an un-allowed application — blocked with EACCES
-  on `~/Vault`.
-- Direct reads of the decrypted backing store by other same-user processes —
-  the plaintext lives on a private tmpfs inside the guard's mount namespace,
-  not in `~/.vault-plain`.
-- Anyone reading the files when the USB key is absent — they're just
-  AES-256-GCM ciphertext.
-- Files lingering decrypted after you unplug, click Lock, or the machine
-  sleeps — the vault is force-unmounted (lazy unmount) immediately.
-- Inheriting access through a parent editor (`code`, Cursor, etc.). Only the
-  calling PID's executable is checked.
 
-**What it does *not* fully stop (same-user threat model is inherently hard):**
-- A process running as you that can **replace or modify an allowed binary**, or
-  **`ptrace`/inject into an already-allowed app**, could get data through that
-  app's identity. That's a much higher bar than a naive file read, but it's
-  possible for a determined same-user attacker. Combining with the optional
-  AppArmor profile and keeping allowed apps to a minimum reduces this.
-- The FUSE guard is not a substitute for a full MAC/sandbox; it's a pragmatic,
-  no-root barrier. `/proc/<pid>/exe` is also a TOCTOU against PID reuse.
-- Root on the machine can bypass everything. This tool protects against
-  same-*user* threats, not against a compromised root.
-- Unlock requires unprivileged user namespaces (`kernel.unprivileged_userns_clone=1`,
-  Ubuntu default). If they are disabled, unlock refuses rather than exposing
-  plaintext on the host.
+- python / cat / Cursor / a shell running **as you** reading `~/Vault` -> `EACCES`
+  (you are not in group `vaultguard`; the mount is `0750`).
+- Direct reads of ciphertext when the USB key is absent — AES-256-GCM.
+- Files lingering decrypted after unplug / Lock / suspend — lazy unmount.
+- Opening `~/Vault` from Cursor or a terminal as yourself.
 
-**Defense-in-depth recommendation:** for the highest-value secrets, the
-strongest option remains a separate, network-limited machine. Vault Guardian is
-the convenient middle ground you asked for: strong, USB-gated, per-app control
-without a second box.
+**Residual (be honest):**
 
-### Optional AppArmor layer
-If you answered "yes" to AppArmor during setup (and have `apparmor-utils`), a
-profile is generated at `/etc/apparmor.d/vault-guardian` and loaded with
-`apparmor_parser`. This adds kernel-enforced deny rules for the vault path on
-top of the FUSE guard. It needs `sudo` once when applied. See
-`apparmor_manager.py --print` to inspect the generated policy before using it.
+- **Allowed app as oracle.** Anything on the allowlist can read the vault.
+  Keep the list tiny. Do not add terminals, python, or IDEs.
+- **Copies to `/tmp`.** An allowed app can export a copy outside `~/Vault`.
+  Those copies are yours again.
+- **Root bypass.** Root can switch to `vaultguard` or read the mount. This is
+  same-user protection, not anti-root.
+- **sgid is not a sandbox.** `vault-exec` only adds a group and execs a
+  realpath-matched binary. It sanitizes `LD_*` / `PYTHON*` and related
+  env vars; it does not confine the child. Children of an allowed app inherit
+  `egid=vaultguard` (needed for LibreOffice helpers) — that is why `code` /
+  `bash` / `python` are not defaults.
+- **Password in your head, not on disk.** Auto-unlock blobs are wiped.
+
+**Defense-in-depth:** for the highest-value secrets, a separate
+network-limited machine is still stronger. This is the convenient middle
+ground: USB-gated, DAC isolation, one-time sudo, works on Jetson.
+
+AppArmor is optional and typically unusable on L4T. It is **not** called
+from the unlock path.
 
 ---
 
@@ -244,90 +247,48 @@ top of the FUSE guard. It needs `sudo` once when applied. See
 
 | File | Purpose |
 |------|---------|
-| `install.sh` | One-command installer (Ubuntu-first; Python deps go in a venv) |
+| `install.sh` | User-level installer (venv, udev, systemd). Prints run privileged. |
+| `install-privileged.sh` | One-time sudo: vaultguard user, sgid helper, sudoers, ACLs |
+| `vault-exec.c` | Tiny C sgid helper (never sgid Python) |
 | `setup_wizard.py` | First-time setup + config/crypto helpers |
-| `vault_manager.py` | gocryptfs mount / unmount (safe subprocess) |
+| `vault_manager.py` | gocryptfs mount/unmount as vaultguard (`sudo -n`) |
 | `usb_monitor.py` | udev USB add/remove detection by serial hash |
-| `no_sudo_fuse_guard.py` | **Primary** per-app allowlist FUSE guard (no root) |
-| `mountns.py` | Unprivileged user+mount namespace helper |
-| `apparmor_manager.py` | Optional kernel AppArmor profile generator |
-| `tray_app.py` | System-tray UI + orchestration |
+| `tray_app.py` | System-tray UI + orchestration (headless USB lock) |
 | `vault_guardian.py` | Entry point launched by systemd/CLI |
-| `vault-guardian.service` | systemd **user** service unit (`ExecStart` = `vault-guardian` wrapper) |
-| `requirements.txt` | Python dependencies (installed into the venv) |
-
-The venv itself is created at install time under
-`~/.local/share/vault-guardian/venv` and is not part of the git repo.
+| `vault-guardian.service` | systemd **user** service |
+| `requirements.txt` | Python deps (no FUSE Python bindings) |
+| `tests/test_vault_exec.sh` | Compile + allow/deny smoke test |
 
 ---
 
 ## Troubleshooting
 
-**Tray icon doesn't appear.**
-- The USB lock still works without an icon. Confirm the service is active:
-  `systemctl --user status vault-guardian`. If it is `inactive (dead)` with
-  `Xlib.error.DisplayNameError: Bad display name ""` in the journal, you are
-  on a build that crashed without `DISPLAY`. Pull `main` and re-run
-  `./install.sh` — the daemon now stays up headless and infers `:0` /
-  `wayland-0` when a session exists.
-- On GNOME, tray icons need the *AppIndicator and KStatusNotifierItem*
-  extension. Ubuntu 24.04 / Jetson often has no indicator area otherwise.
-- Verify GTK: `~/.local/share/vault-guardian/venv/bin/python -c "import gi; gi.require_version('Gtk','3.0')"`.
-- `journalctl --user -u vault-guardian -n 50`
+**Unlock failed / privileged helper is missing.**
+Run `sudo ./install-privileged.sh`. Confirm `/etc/sudoers.d/vault-guardian`.
+
+**Unlock failed: bad password.**
+The password is sent on stdin to gocryptfs, never argv. Re-enter it.
+
+**`ls ~/Vault` says Permission denied while unlocked.**
+Success. Use **Open with allowed app...**.
+
+**Tray icon does not appear.**
+USB lock still works. `systemctl --user status vault-guardian`.
+On GNOME you need the AppIndicator extension.
 
 **Unplugging the USB key does nothing.**
-- The monitor is the same process as the tray. If the service is dead, unplug
-  cannot lock. `systemctl --user restart vault-guardian` then
-  `systemctl --user status vault-guardian` should show `active (running)`.
+`systemctl --user restart vault-guardian`. The monitor is the same process.
 
-**`~/Vault` is empty even with the key inserted.**
-- Confirm the key is the registered one: tray → *Change USB Key…* re-selects.
-- Check the log: `tail -f ~/.local/share/vault-guardian/access.log`.
-- Make sure `gocryptfs` is installed: `which gocryptfs`.
+**Transport endpoint is not connected on `~/Vault`.**
+Stale mount. Lock runs `fusermount3 -u` then `-u -z` as vaultguard.
 
-**My allowed app still can't open files.**
-- Some apps launch helper binaries with different names (e.g. LibreOffice →
-  `soffice.bin`). Those are handled, but for others add the real binary path.
-  Find it with `ps -e -o pid,comm,exe` or `readlink /proc/<pid>/exe` while the
-  app runs, then add that path in *Allowed Apps…*.
-- After changing allowed apps, **lock and unlock** (or re-plug the key) so the
-  guard restarts with the new list.
+**NVIDIA Jetson: display died after an *old* install.**
+Recover over SSH: `sudo apt install --reinstall nvidia-l4t-x11 nvidia-l4t-3d-core`.
+Current scripts hold `nvidia-l4t-*`, use `--no-upgrade --no-install-recommends`,
+and only udev-trigger USB/block.
 
-**"Transport endpoint is not connected" on `~/Vault`.**
-- A stale mount. Run: `fusermount -u ~/Vault` then unlock again.
-  (Older installs may also need `fusermount -u ~/.vault-plain`.)
-
-**Unlock fails with "Could not enter a private mount namespace".**
-- This machine blocked the user+mount namespace the guard needs, so it
-  refuses rather than leaving plaintext in `~/.vault-plain`. Check
-  `sysctl kernel.unprivileged_userns_clone` (should be 1). On Ubuntu 24.04
-  also `kernel.apparmor_restrict_unprivileged_userns`. The guard now writes
-  `/proc/self/setgroups` without `O_CREAT` (Jetson L4T used to return
-  EACCES) and falls back to `/usr/bin/unshare --map-root-user`.
-
-**NVIDIA Jetson: display died after install (black HDMI, no desktop).**
-- An older installer ran `apt-get install` of GTK/FUSE/AppArmor after
-  `apt-get update`, which on L4T can remove `nvidia-l4t-x11` /
-  `nvidia-l4t-3d-core`. It also ran an unfiltered `udevadm trigger`.
-  Recover over SSH (this is what NVIDIA documents):
-  `sudo apt install --reinstall nvidia-l4t-x11 nvidia-l4t-3d-core`
-  Current `install.sh` holds all `nvidia-l4t-*` packages, uses
-  `--no-upgrade --no-install-recommends`, skips any package whose dry-run
-  would touch that stack, and only udev-triggers USB/block.
-
-**pip fails with an externally managed environment.**
-- The installer no longer uses user-site pip. If you see this, you are not
-  using the venv. Use `~/.local/share/vault-guardian/venv/bin/pip`, or re-run
-  `./install.sh`.
-
-**`import gi` fails inside the venv.**
-- Install the system packages: `sudo apt-get install python3-gi gir1.2-gtk-3.0 gir1.2-appindicator3-0.1`.
-- Recreate the venv with system site packages, then pip-install requirements
-  into `~/.local/share/vault-guardian/venv`.
-
-**FUSE "allow_other" errors.** The core setup does not require `allow_other`
-because the guard runs as you. If you customize it and hit this, add
-`user_allow_other` to `/etc/fuse.conf`.
+**FUSE allow_other errors.**
+`install-privileged.sh` adds `user_allow_other` to `/etc/fuse.conf`.
 
 ---
 
@@ -339,9 +300,11 @@ rm -rf ~/.local/share/vault-guardian ~/.config/vault-guardian
 rm -f ~/.config/systemd/user/vault-guardian.service
 rm -f ~/.local/bin/vault-guardian ~/.local/bin/vault-guardian-setup
 sudo rm -f /etc/udev/rules.d/99-vault-guardian.rules
-sudo rm -f /etc/apparmor.d/vault-guardian   # if you used AppArmor
+sudo rm -f /etc/sudoers.d/vault-guardian
+sudo rm -f /usr/local/bin/vault-exec
+sudo rm -rf /etc/vault-guardian
 ```
 
-`rm -rf ~/.local/share/vault-guardian` also removes the venv. Your encrypted data in `~/.vault-encrypted` is left untouched — delete it
+Your encrypted data in `~/.vault-encrypted` is left untouched — delete it
 yourself if you no longer need it (make sure you can decrypt it elsewhere
 first if you want to keep the contents).
