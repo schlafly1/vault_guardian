@@ -298,9 +298,12 @@ The venv itself is created at install time under
   (Older installs may also need `fusermount -u ~/.vault-plain`.)
 
 **Unlock fails with "Could not enter a private mount namespace".**
-- This machine has unprivileged user namespaces disabled. Vault Guardian
-  will not fall back to a host-visible plaintext mount. On Ubuntu check
-  `sysctl kernel.unprivileged_userns_clone` (should be 1).
+- This machine blocked the user+mount namespace the guard needs, so it
+  refuses rather than leaving plaintext in `~/.vault-plain`. Check
+  `sysctl kernel.unprivileged_userns_clone` (should be 1). On Ubuntu 24.04
+  also `kernel.apparmor_restrict_unprivileged_userns`. The guard now writes
+  `/proc/self/setgroups` without `O_CREAT` (Jetson L4T used to return
+  EACCES) and falls back to `/usr/bin/unshare --map-root-user`.
 
 **NVIDIA Jetson: display died after install (black HDMI, no desktop).**
 - An older installer ran `apt-get install` of GTK/FUSE/AppArmor after

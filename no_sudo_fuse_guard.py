@@ -357,6 +357,15 @@ def run_guard(cipherdir: str, mountpoint: str, allowed_apps: List[str],
 
 if __name__ == "__main__":
     import argparse
+    import mountns
+
+    # Enter the user+mount ns before reading the password so a re-exec of
+    # /usr/bin/unshare still inherits the stdin pipe from the tray.
+    if not mountns.in_private_userns():
+        try:
+            mountns.enter_user_mount_ns()
+        except OSError:
+            mountns.reexec_via_unshare()
 
     ap = argparse.ArgumentParser(
         description="Vault Guardian userspace FUSE allowlist guard")
