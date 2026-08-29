@@ -1,20 +1,22 @@
 #!/usr/bin/env bash
 #
-# install.sh - one-command installer for Vault Guardian
+# install.sh - user-level installer for Vault Guardian
 #
 # Installs system + Python dependencies, copies the app into
 # ~/.local/share/vault-guardian, creates a Python venv there (so pip never
 # touches the system interpreter), installs a systemd *user* service, sets up
 # a udev rule, and runs the first-time setup wizard.
 #
-# Run as your NORMAL user (NOT root). It will call sudo only for the few
-# steps that genuinely need it (apt install, udev rule, optional AppArmor).
+# Run as your NORMAL user (NOT root). After this finishes, run the one-time
+# privileged installer:
+#
+#   sudo ./install-privileged.sh
+#
+# For a combined privileged step from this file:
+#   sudo ./install.sh --privileged
 #
 set -euo pipefail
 
-# ---------------------------------------------------------------------------
-# Paths
-# ---------------------------------------------------------------------------
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP_DIR="${HOME}/.local/share/vault-guardian"
 VENV_DIR="${APP_DIR}/venv"
@@ -27,8 +29,18 @@ ok()    { printf '\033[1;32m[+]\033[0m %s\n' "$*"; }
 warn()  { printf '\033[1;33m[!]\033[0m %s\n' "$*"; }
 err()   { printf '\033[1;31m[x]\033[0m %s\n' "$*" >&2; }
 
+# ---------------------------------------------------------------------------
+# Privileged path (clearly separated). Delegates to install-privileged.sh.
+# ---------------------------------------------------------------------------
+if [[ "${1:-}" == "--privileged" ]]; then
+    shift
+    exec "${SRC_DIR}/install-privileged.sh" "$@"
+fi
+
 if [[ "${EUID}" -eq 0 ]]; then
     err "Do not run this installer as root. Run it as your normal user."
+    err "After it finishes:  sudo ${SRC_DIR}/install-privileged.sh"
+    err "(or: sudo $0 --privileged)"
     exit 1
 fi
 
@@ -110,17 +122,14 @@ install_system_deps() {
         fi
         sudo apt-get update -y || warn "apt update failed (continuing)"
 
-        # Required for the vault itself.
+        # Required for the vault itself. Do NOT install libfuse2/libfuse2t64
+        # for this app (no fusepy). Need gocryptfs + fuse3/fusermount3.
         safe_apt_install gocryptfs 0 || true
-        # fusepy needs libfuse.so.2. fusermount3 (fuse3) is not enough and
-        # is already present on Ubuntu 24.04 / Jetson, so the old installer
-        # skipped fuse2 and FUSE() then died with RuntimeError: 1.
-        safe_apt_install libfuse2t64 1 || safe_apt_install libfuse2 1 || true
-        if ! command -v fusermount >/dev/null 2>&1; then
-            safe_apt_install fuse 1 || true
+        if ! command -v fusermount3 >/dev/null 2>&1 && ! command -v fusermount >/dev/null 2>&1; then
+            safe_apt_install fuse3 0 || safe_apt_install fuse 0 || true
         fi
-        if ! command -v fusermount >/dev/null 2>&1 && ! command -v fusermount3 >/dev/null 2>&1; then
-            safe_apt_install fuse3 0 || true
+        if ! command -v fusermount3 >/dev/null 2>&1; then
+            safe_apt_install fuse3 1 || true
         fi
         safe_apt_install python3 0 || true
         safe_apt_install python3-pip 0 || true
@@ -135,26 +144,23 @@ install_system_deps() {
             safe_apt_install python3-gi 1 || true
             safe_apt_install gir1.2-gtk-3.0 1 || true
         fi
-        # AppIndicator is optional; Ubuntu 22.04+ often has ayatana instead.
         safe_apt_install gir1.2-ayatanaappindicator3-0.1 1 || \
             safe_apt_install gir1.2-appindicator3-0.1 1 || true
 
-        # AppArmor is optional hardening, not required for the vault.
-        # Never install it automatically on L4T.
-        if ! is_tegra; then
-            safe_apt_install apparmor-utils 1 || true
-        else
-            info "Skipping apparmor-utils on Jetson (optional; not needed for the vault)"
+        # AppArmor is optional/dead on Jetson; do not install it on tegra and
+        # do not call it from the unlock path.
+        if is_tegra; then
+            info "Skipping apparmor-utils on Jetson (optional; not used)"
         fi
     elif command -v dnf >/dev/null 2>&1; then
-        sudo dnf install -y gocryptfs fuse python3-pip python3-gobject \
-            gtk3 libappindicator-gtk3 apparmor-utils || \
+        sudo dnf install -y gocryptfs fuse3 python3-pip python3-gobject \
+            gtk3 libappindicator-gtk3 || \
             warn "some dnf packages missing"
     elif command -v pacman >/dev/null 2>&1; then
-        sudo pacman -Sy --noconfirm gocryptfs fuse2 python-pip python-gobject \
-            gtk3 libappindicator-gtk3 apparmor || warn "some pacman pkgs missing"
+        sudo pacman -Sy --noconfirm gocryptfs fuse3 python-pip python-gobject \
+            gtk3 libappindicator-gtk3 || warn "some pacman pkgs missing"
     else
-        warn "Unknown distro. Please install manually: gocryptfs, fuse, "
+        warn "Unknown distro. Please install manually: gocryptfs, fuse3, "
         warn "python3-gi, GTK3, libappindicator3, python3-venv."
     fi
     ok "System dependencies step complete."
@@ -163,25 +169,10 @@ install_system_deps() {
 # ---------------------------------------------------------------------------
 # 2. Copy application files
 # ---------------------------------------------------------------------------
-copy_app() {
-    info "Installing application to ${APP_DIR}"
-    mkdir -p "${APP_DIR}" "${BIN_DIR}"
-    for f in vault_guardian.py tray_app.py setup_wizard.py vault_manager.py \
-             usb_monitor.py apparmor_manager.py no_sudo_fuse_guard.py mountns.py \
-             requirements.txt README.md; do
-        install -m 0644 "${SRC_DIR}/${f}" "${APP_DIR}/${f}"
-    done
-    # Executables
-    chmod 0755 "${APP_DIR}/vault_guardian.py" \
-               "${APP_DIR}/tray_app.py" \
-               "${APP_DIR}/setup_wizard.py" \
-               "${APP_DIR}/no_sudo_fuse_guard.py" \
-               "${APP_DIR}/vault_manager.py" \
-               "${APP_DIR}/usb_monitor.py" \
-               "${APP_DIR}/apparmor_manager.py"
-
-    # Convenience launchers on PATH. They always use the venv interpreter.
-    cat > "${BIN_DIR}/vault-guardian" <<EOF
+write_launcher() {
+    # $1=dest  uses VENV_DIR APP_DIR from parent
+    local dest="$1" target="$2"
+    cat > "${dest}" <<LAUNCH
 #!/usr/bin/env bash
 # systemd --user often has empty DISPLAY. Infer a live session so the tray
 # can start; the Python process still runs headless if none exists.
@@ -196,13 +187,45 @@ if [[ -z "\${DISPLAY:-}" && -z "\${WAYLAND_DISPLAY:-}" ]]; then
     fi
   done
 fi
-exec "${VENV_DIR}/bin/python" "${APP_DIR}/vault_guardian.py" "\$@"
-EOF
-    cat > "${BIN_DIR}/vault-guardian-setup" <<EOF
+exec "${VENV_DIR}/bin/python" "${APP_DIR}/${target}" "\$@"
+LAUNCH
+    chmod 0755 "${dest}"
+}
+
+copy_app() {
+    info "Installing application to ${APP_DIR}"
+    mkdir -p "${APP_DIR}" "${BIN_DIR}"
+    for f in vault_guardian.py tray_app.py setup_wizard.py vault_manager.py \
+             usb_monitor.py requirements.txt README.md vault-exec.c \
+             install-privileged.sh vault-guardian.service; do
+        if [[ ! -f "${SRC_DIR}/${f}" ]]; then
+            warn "missing ${f} (skipping)"
+            continue
+        fi
+        if [[ "${f}" == *.sh ]]; then
+            install -m 0755 "${SRC_DIR}/${f}" "${APP_DIR}/${f}"
+        else
+            install -m 0644 "${SRC_DIR}/${f}" "${APP_DIR}/${f}"
+        fi
+    done
+    if [[ -d "${SRC_DIR}/tests" ]]; then
+        mkdir -p "${APP_DIR}/tests"
+        install -m 0644 "${SRC_DIR}/tests/"* "${APP_DIR}/tests/" 2>/dev/null || true
+        chmod 0755 "${APP_DIR}/tests/"*.sh 2>/dev/null || true
+    fi
+    chmod 0755 "${APP_DIR}/vault_guardian.py" \
+               "${APP_DIR}/tray_app.py" \
+               "${APP_DIR}/setup_wizard.py" \
+               "${APP_DIR}/vault_manager.py" \
+               "${APP_DIR}/usb_monitor.py" \
+               "${APP_DIR}/install-privileged.sh" 2>/dev/null || true
+
+    write_launcher "${BIN_DIR}/vault-guardian" "vault_guardian.py"
+    cat > "${BIN_DIR}/vault-guardian-setup" <<SETUP
 #!/usr/bin/env bash
 exec "${VENV_DIR}/bin/python" "${APP_DIR}/setup_wizard.py" "\$@"
-EOF
-    chmod 0755 "${BIN_DIR}/vault-guardian" "${BIN_DIR}/vault-guardian-setup"
+SETUP
+    chmod 0755 "${BIN_DIR}/vault-guardian-setup"
     ok "Application files installed."
 
     case ":${PATH}:" in
@@ -220,7 +243,6 @@ install_python_deps() {
         err "python3-venv is not available. On Ubuntu: sudo apt-get install python3-venv"
         exit 1
     fi
-    # --system-site-packages so apt-installed python3-gi / GTK bindings work.
     python3 -m venv --system-site-packages "${VENV_DIR}"
     local pip="${VENV_DIR}/bin/pip"
     local py="${VENV_DIR}/bin/python"
@@ -236,13 +258,13 @@ install_udev_rule() {
     info "Installing udev rule (needs sudo) so USB events wake the monitor..."
     local tmp
     tmp="$(mktemp)"
-    cat > "${tmp}" <<'EOF'
+    cat > "${tmp}" <<'RULE'
 # Vault Guardian: tag USB storage / devices so the user monitor is notified.
 # The tray app uses pyudev netlink monitoring; this rule simply ensures udev
 # processes USB add/remove events promptly for all users.
 ACTION=="add|remove", SUBSYSTEM=="block", ENV{ID_BUS}=="usb", TAG+="vault_guardian"
 ACTION=="add|remove", SUBSYSTEM=="usb", TAG+="vault_guardian"
-EOF
+RULE
     if sudo install -m 0644 "${tmp}" "${UDEV_RULE}"; then
         sudo udevadm control --reload-rules || true
         # Never `udevadm trigger` with no filter: that replays EVERY device,
@@ -303,13 +325,21 @@ main() {
     install_service
     run_setup
     echo
-    ok "Installation complete."
+    ok "User-level installation complete."
     echo
-    echo "Next steps:"
-    echo "  1. Start it now:   systemctl --user start vault-guardian"
-    echo "     (or just run:   vault-guardian )"
+    echo "NOW run the one-time privileged installer (needs sudo):"
+    echo "    sudo ${SRC_DIR}/install-privileged.sh"
+    echo "  (or: sudo ${APP_DIR}/install-privileged.sh)"
+    echo
+    echo "That creates system user/group vaultguard, the sgid vault-exec"
+    echo "helper, sudoers, and ACLs. It will NOT add you to group vaultguard."
+    echo
+    echo "Then:"
+    echo "  1. Start it:   systemctl --user start vault-guardian"
+    echo "     (or just:   vault-guardian )"
     echo "  2. Look for the padlock icon in your system tray."
-    echo "  3. Put files into your vault by opening ~/Vault while unlocked."
+    echo "  3. Unlock, then open files via 'Open with allowed app…'"
+    echo "     (ls ~/Vault as yourself will get EACCES — that is success)."
     echo
     echo "Python packages live in ${VENV_DIR} (not system Python)."
     echo "Read the README for the security model and its honest limits."

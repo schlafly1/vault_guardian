@@ -2,25 +2,39 @@
 """
 vault_manager.py
 ================
-Handles mounting and unmounting of the gocryptfs encrypted vault.
+Mount / unmount the gocryptfs vault as system user ``vaultguard``.
 
 Design notes
 ------------
 * All subprocess calls use argument lists (NEVER shell=True) so vault
   paths / passwords can't be interpreted by a shell.
-* gocryptfs reads the password from stdin (``-extpass`` is avoided so the
-  password never appears in the process list / argv).
+* gocryptfs reads the password from stdin (never argv, never ``-extpass``).
+* The plaintext mount is owned by vaultguard:vaultguard mode 0750. The
+  login user is NOT in that group; only ``vault-exec`` (sgid) grants it.
 * ``mount_vault`` is idempotent: if the mount point is already a live
   gocryptfs mount it returns True without doing anything.
 """
 
 from __future__ import annotations
 
+import errno
 import os
-import subprocess
 import shutil
+import subprocess
 import time
-from typing import Optional
+from typing import List, Optional
+
+VAULTGUARD_USER = "vaultguard"
+MOUNT_HELPER = "/usr/local/libexec/vault-guardian/mount"
+UNMOUNT_HELPER = "/usr/local/libexec/vault-guardian/unmount"
+
+# gocryptfs registers as fuse.gocryptfs (fuse3) or gocryptfs in /proc/mounts.
+_GOCRYPTFS_TYPES = frozenset({"fuse.gocryptfs", "gocryptfs", "fuse"})
+
+PRIV_HINT = (
+    "The privileged helper is missing or sudoers is not configured. "
+    "Run: sudo ./install-privileged.sh"
+)
 
 
 class VaultError(Exception):
@@ -37,22 +51,86 @@ def _which(binary: str) -> str:
     return path
 
 
+def _gocryptfs_path() -> str:
+    for p in ("/usr/bin/gocryptfs", "/usr/local/bin/gocryptfs"):
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+    return _which("gocryptfs")
+
+
+def _fusermount_paths() -> List[str]:
+    found: List[str] = []
+    for p in ("/usr/bin/fusermount3", "/usr/bin/fusermount"):
+        if os.path.isfile(p) and os.access(p, os.X_OK) and p not in found:
+            found.append(p)
+    for name in ("fusermount3", "fusermount"):
+        w = shutil.which(name)
+        if w and w not in found:
+            found.append(w)
+    return found
+
+
+def _is_sudo_failure(proc: subprocess.CompletedProcess) -> bool:
+    err = (proc.stderr or b"").decode("utf-8", "replace")
+    out = (proc.stdout or b"").decode("utf-8", "replace")
+    text = (err + "\n" + out).lower()
+    needles = (
+        "a password is required",
+        "password is required",
+        "not allowed to execute",
+        "unknown user",
+        "unknown group",
+        "no tty present",
+        "sorry, user",
+    )
+    if any(n in text for n in needles):
+        return True
+    # sudo prefixes its own diagnostics with "sudo:".
+    if "sudo:" in text and proc.returncode != 0:
+        return True
+    return False
+
+
+def _run_as_vaultguard(args: List[str],
+                       input_bytes: Optional[bytes] = None
+                       ) -> subprocess.CompletedProcess:
+    cmd = ["sudo", "-n", "-u", VAULTGUARD_USER, "--"] + args
+    return subprocess.run(
+        cmd,
+        input=input_bytes,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+
 def is_mounted(mount_point: str) -> bool:
     """Return True if *mount_point* is currently a mounted filesystem.
 
-    We consult /proc/mounts directly rather than shelling out to
-    ``mountpoint`` so this is fast and dependency-free.
+    Consults /proc/mounts. Recognises both ``fuse.gocryptfs`` and
+    ``gocryptfs`` (and a generic ``fuse`` fstype at that path).
     """
-    mount_point = os.path.realpath(mount_point)
+    try:
+        mount_point = os.path.realpath(mount_point)
+    except OSError:
+        pass
     try:
         with open("/proc/mounts", "r", encoding="utf-8") as fh:
             for line in fh:
                 parts = line.split()
-                if len(parts) >= 2:
-                    # /proc/mounts escapes spaces as \040 - unescape target
-                    target = parts[1].replace("\\040", " ")
-                    if os.path.realpath(target) == mount_point:
-                        return True
+                if len(parts) < 3:
+                    continue
+                target = parts[1].replace("\\040", " ")
+                fstype = parts[2]
+                try:
+                    same = os.path.realpath(target) == mount_point
+                except OSError:
+                    same = target == mount_point
+                if not same:
+                    continue
+                if fstype in _GOCRYPTFS_TYPES or "gocryptfs" in fstype:
+                    return True
+                # Something else is mounted here (stale FUSE, etc.).
+                return True
     except FileNotFoundError:
         pass
     return False
@@ -64,17 +142,18 @@ def vault_is_initialized(vault_path: str) -> bool:
 
 
 def init_vault(vault_path: str, password: str) -> None:
-    """Initialise a brand new gocryptfs vault at *vault_path*.
+    """Initialise a brand new gocryptfs vault at *vault_path* as the human.
 
     Raises VaultError on failure. No-op if the vault already exists.
+    Does not wipe an existing ~/.vault-encrypted.
     """
-    gocryptfs = _which("gocryptfs")
+    gocryptfs = _gocryptfs_path()
     os.makedirs(vault_path, exist_ok=True)
 
     if vault_is_initialized(vault_path):
         return
 
-    # gocryptfs -init reads password twice (confirm) from stdin.
+    # gocryptfs -init reads password twice (confirm) from stdin. Never argv.
     proc = subprocess.run(
         [gocryptfs, "-init", "-q", vault_path],
         input=f"{password}\n{password}\n".encode("utf-8"),
@@ -88,53 +167,68 @@ def init_vault(vault_path: str, password: str) -> None:
         )
 
 
+def _ensure_mount_point(mount_point: str) -> None:
+    """Create *mount_point* if missing. Do not chmod it (must stay 0750
+    vaultguard:vaultguard after the privileged installer). EACCES is
+    expected when the dir already exists with those permissions.
+    """
+    try:
+        if os.path.isdir(mount_point):
+            return
+    except OSError:
+        # Cannot even stat; privileged install owns it. That's success.
+        return
+    try:
+        os.makedirs(mount_point, exist_ok=True)
+    except OSError as e:
+        if e.errno == errno.EACCES:
+            return
+        raise VaultError(
+            f"Cannot create mount point {mount_point}: {e}. {PRIV_HINT}"
+        )
+
+
 def mount_vault(
     vault_path: str,
     mount_point: str,
     password: str,
-    allow_other: bool = False,
+    allow_other: bool = True,
 ) -> bool:
-    """Mount the gocryptfs vault at *vault_path* onto *mount_point*.
+    """Mount the gocryptfs vault as user vaultguard onto *mount_point*.
 
-    Parameters
-    ----------
-    allow_other:
-        When True the mount is created with ``-allow_other`` so a separate
-        FUSE guard process (or root-owned services) can read the plaintext.
-        The FUSE guard needs this to passthrough.
+    ``allow_other`` is always passed (gocryptfs ``-allow_other``) so the
+    sgid helper's children can reach the plaintext. Password is sent on
+    stdin, never argv.
 
     Returns True on success. Raises VaultError on failure.
     """
-    gocryptfs = _which("gocryptfs")
-
     if not vault_is_initialized(vault_path):
         raise VaultError(
             f"No gocryptfs vault found at {vault_path}. Run the setup wizard first."
         )
 
-    os.makedirs(mount_point, exist_ok=True)
+    if not os.path.isfile(MOUNT_HELPER):
+        raise VaultError("Failed to mount vault: " + PRIV_HINT)
+
+    _ensure_mount_point(mount_point)
 
     if is_mounted(mount_point):
         return True
 
-    args = [gocryptfs, "-q"]
-    if allow_other:
-        args.append("-allow_other")
-    args += [vault_path, mount_point]
-
-    proc = subprocess.run(
-        args,
-        input=f"{password}\n".encode("utf-8"),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+    # Wrapper has paths baked in (no argv). Password on stdin, never argv.
+    proc = _run_as_vaultguard(
+        [MOUNT_HELPER],
+        input_bytes=f"{password}\n".encode("utf-8"),
     )
     if proc.returncode != 0:
-        raise VaultError(
-            "Failed to mount vault: "
-            + proc.stderr.decode("utf-8", "replace").strip()
-        )
+        if _is_sudo_failure(proc):
+            raise VaultError("Failed to mount vault: " + PRIV_HINT)
+        err = proc.stderr.decode("utf-8", "replace").strip()
+        low = err.lower()
+        if "password incorrect" in low or "password" in low:
+            raise VaultError("Failed to mount vault: bad password.")
+        raise VaultError("Failed to mount vault: " + (err or PRIV_HINT))
 
-    # Give the kernel a moment to register the mount.
     for _ in range(20):
         if is_mounted(mount_point):
             return True
@@ -143,7 +237,7 @@ def mount_vault(
 
 
 def unmount_vault(mount_point: str, force: bool = True) -> bool:
-    """Unmount *mount_point* using fusermount.
+    """Unmount *mount_point* as vaultguard using fusermount3 (or fusermount).
 
     Returns True if the mount point ends up unmounted (including the case
     where it was already unmounted). ``force`` adds lazy unmount fallback so
@@ -152,42 +246,23 @@ def unmount_vault(mount_point: str, force: bool = True) -> bool:
     if not is_mounted(mount_point):
         return True
 
-    fusermount = shutil.which("fusermount") or shutil.which("fusermount3")
-    if not fusermount:
-        raise VaultError("fusermount not found - cannot unmount vault.")
+    if not os.path.isfile(UNMOUNT_HELPER):
+        raise VaultError("Failed to unmount vault: " + PRIV_HINT)
 
-    # Try a clean unmount first.
-    proc = subprocess.run(
-        [fusermount, "-u", mount_point],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    if proc.returncode == 0 and not is_mounted(mount_point):
-        return True
-
-    if force:
-        # Lazy unmount detaches the filesystem immediately even if busy so
-        # the plaintext view disappears the instant the USB key is pulled.
-        proc = subprocess.run(
-            [fusermount, "-u", "-z", mount_point],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        for _ in range(20):
-            if not is_mounted(mount_point):
-                return True
-            time.sleep(0.05)
-
+    proc = _run_as_vaultguard([UNMOUNT_HELPER])
+    if _is_sudo_failure(proc):
+        raise VaultError("Failed to unmount vault: " + PRIV_HINT)
+    for _ in range(20):
+        if not is_mounted(mount_point):
+            return True
+        time.sleep(0.05)
     if is_mounted(mount_point):
-        raise VaultError(
-            "Failed to unmount vault: "
-            + proc.stderr.decode("utf-8", "replace").strip()
-        )
+        err = (proc.stderr or b"").decode("utf-8", "replace").strip()
+        raise VaultError("Failed to unmount vault: " + (err or "mount still busy"))
     return True
 
 
 if __name__ == "__main__":
-    # Tiny manual smoke test / CLI helper.
     import argparse
 
     ap = argparse.ArgumentParser(description="Vault Guardian mount helper")

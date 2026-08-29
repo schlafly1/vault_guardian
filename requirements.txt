@@ -5,5 +5,4 @@
 pyudev>=0.24.0        # USB / udev device monitoring
 pystray>=0.19.4       # System tray icon + menu
 Pillow>=9.0.0         # Icon generation for the tray
-cryptography>=41.0.0  # Key derivation / auto-unlock secret storage
-fusepy>=3.0.1         # Userspace FUSE guard (per-app allowlist enforcement)
+cryptography>=41.0.0  # Key derivation / leftover auto-unlock blob wipe
