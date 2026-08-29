@@ -112,9 +112,15 @@ install_system_deps() {
 
         # Required for the vault itself.
         safe_apt_install gocryptfs 0 || true
-        # Prefer an already-present FUSE userspace (fuse3 on Ubuntu 22.04+).
+        # fusepy needs libfuse.so.2. fusermount3 (fuse3) is not enough and
+        # is already present on Ubuntu 24.04 / Jetson, so the old installer
+        # skipped fuse2 and FUSE() then died with RuntimeError: 1.
+        safe_apt_install libfuse2t64 1 || safe_apt_install libfuse2 1 || true
+        if ! command -v fusermount >/dev/null 2>&1; then
+            safe_apt_install fuse 1 || true
+        fi
         if ! command -v fusermount >/dev/null 2>&1 && ! command -v fusermount3 >/dev/null 2>&1; then
-            safe_apt_install fuse 0 || safe_apt_install fuse3 0 || true
+            safe_apt_install fuse3 0 || true
         fi
         safe_apt_install python3 0 || true
         safe_apt_install python3-pip 0 || true

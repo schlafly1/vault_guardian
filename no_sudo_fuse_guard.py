@@ -315,6 +315,58 @@ def _mount_gocryptfs(cipherdir: str, backing: str, password: bytes) -> None:
         raise RuntimeError("gocryptfs did not come up in time")
 
 
+
+def _unmount_quiet(path: str) -> None:
+    import shutil
+    for name in ("fusermount3", "fusermount"):
+        exe = shutil.which(name)
+        if exe:
+            subprocess.run([exe, "-u", "-z", path],
+                           stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL)
+
+
+def _export_vault(fs, mountpoint: str, foreground: bool, log_fn) -> None:
+    """Mount the allowlist FUSE on *mountpoint*. Blocking if foreground."""
+    import ctypes.util
+    def _say(msg: str) -> None:
+        print(msg, file=sys.stderr)
+    _say("libfuse=%s libfuse3=%s euid=%s" % (
+        ctypes.util.find_library("fuse"),
+        ctypes.util.find_library("fuse3"),
+        os.geteuid(),
+    ))
+    _unmount_quiet(mountpoint)
+    os.makedirs(mountpoint, exist_ok=True)
+
+    # Inside a uid-only userns we are euid 0 / egid overflow. default_permissions
+    # plus allow_other=False often makes libfuse immediately return 1. Try the
+    # combinations that work for fuse2-in-userns, then fuse3.
+    attempts = [
+        dict(allow_other=True),
+        dict(allow_other=False),
+        dict(allow_other=True, default_permissions=True),
+        dict(allow_other=True, nonempty=True),
+    ]
+    last = None
+    for opts in attempts:
+        try:
+            _say("FUSE mount %s %s" % (mountpoint, opts))
+            FUSE(fs, mountpoint, foreground=foreground, nothreads=False, **opts)
+            return
+        except RuntimeError as e:
+            last = e
+            _say("FUSE failed %s: %s" % (opts, e))
+            _unmount_quiet(mountpoint)
+    raise RuntimeError(
+        "FUSE could not mount %s (%s). "
+        "If this is Ubuntu 24.04/Jetson, install libfuse2 "
+        "(sudo apt-get install --no-install-recommends libfuse2t64 || "
+        "sudo apt-get install --no-install-recommends libfuse2) "
+        "and: fusermount -u %s" % (mountpoint, last, mountpoint)
+    ) from last
+
+
 def run_guard(cipherdir: str, mountpoint: str, allowed_apps: List[str],
               password: bytes, log_fn=None, foreground: bool = True) -> None:
     """Isolate plaintext, mount gocryptfs, then FUSE-export *mountpoint*.
@@ -341,18 +393,9 @@ def run_guard(cipherdir: str, mountpoint: str, allowed_apps: List[str],
 
     _mount_gocryptfs(cipherdir, backing, password)
 
-    os.makedirs(mountpoint, exist_ok=True)
     policy = AllowlistPolicy(allowed_apps, self_pid=os.getpid())
     fs = VaultGuardFS(backing, policy, log_fn=log_fn)
-
-    FUSE(
-        fs,
-        mountpoint,
-        foreground=foreground,
-        nothreads=False,
-        allow_other=False,
-        default_permissions=True,
-    )
+    _export_vault(fs, mountpoint, foreground, log_fn or (lambda *a, **k: None))
 
 
 if __name__ == "__main__":
