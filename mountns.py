@@ -72,12 +72,19 @@ def _write_proc(path: str, data: str) -> None:
 
 
 def write_userns_maps(uid: int, gid: int) -> None:
-    """Map root-in-namespace to the real uid/gid so mount(2) works."""
-    # setgroups MUST be deny'd before gid_map, and uid_map last-or-first
-    # is fine as long as setgroups precedes gid_map.
-    _write_proc("/proc/self/setgroups", "deny\n")
+    """Map uid 0 in-namespace to the real uid so mount(2) works.
+
+    Jetson L4T (and some AppArmor setups) deny /proc/self/setgroups even
+    after apparmor_restrict_unprivileged_userns=0. uid_map alone is enough:
+    we become euid 0 in the ns (CAP_SYS_ADMIN) and gid lands on overflow
+    (nogroup). That matches `unshare --user --map-user=0 --mount`.
+    """
+    try:
+        _write_proc("/proc/self/setgroups", "deny\n")
+        _write_proc("/proc/self/gid_map", f"0 {gid} 1\n")
+    except OSError:
+        pass
     _write_proc("/proc/self/uid_map", f"0 {uid} 1\n")
-    _write_proc("/proc/self/gid_map", f"0 {gid} 1\n")
 
 
 def in_private_userns() -> bool:
@@ -117,8 +124,7 @@ def reexec_via_unshare() -> None:
     script = os.path.realpath(sys.argv[0])
     os.execv(unshare_bin, [
         "unshare",
-        "--user", "--map-root-user", "--mount",
-        "--setgroups=deny",
+        "--user", "--map-user=0", "--mount",
         "--",
         sys.executable, script, *sys.argv[1:],
     ])
