@@ -1,5 +1,5 @@
 [Unit]
-Description=Vault Guardian - USB-gated encrypted vault with per-app allowlist
+Description=Vault Guardian - USB-gated encrypted folder
 After=graphical-session.target
 PartOf=graphical-session.target
 # Don't restart-storm if the tray backend is missing; USB monitor stays up

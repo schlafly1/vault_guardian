@@ -7,13 +7,9 @@
 # touches the system interpreter), installs a systemd *user* service, sets up
 # a udev rule, and runs the first-time setup wizard.
 #
-# Run as your NORMAL user (NOT root). After this finishes, run the one-time
-# privileged installer:
-#
-#   sudo ./install-privileged.sh
-#
-# For a combined privileged step from this file:
-#   sudo ./install.sh --privileged
+# Run as your NORMAL user (NOT root). sudo is used only for apt and the
+# udev rule. There is no privileged helper, no vaultguard user, no
+# vault-exec, no sudoers.
 #
 set -euo pipefail
 
@@ -29,18 +25,9 @@ ok()    { printf '\033[1;32m[+]\033[0m %s\n' "$*"; }
 warn()  { printf '\033[1;33m[!]\033[0m %s\n' "$*"; }
 err()   { printf '\033[1;31m[x]\033[0m %s\n' "$*" >&2; }
 
-# ---------------------------------------------------------------------------
-# Privileged path (clearly separated). Delegates to install-privileged.sh.
-# ---------------------------------------------------------------------------
-if [[ "${1:-}" == "--privileged" ]]; then
-    shift
-    exec "${SRC_DIR}/install-privileged.sh" "$@"
-fi
-
 if [[ "${EUID}" -eq 0 ]]; then
     err "Do not run this installer as root. Run it as your normal user."
-    err "After it finishes:  sudo ${SRC_DIR}/install-privileged.sh"
-    err "(or: sudo $0 --privileged)"
+    err "sudo is used only for apt and the udev rule."
     exit 1
 fi
 
@@ -123,7 +110,8 @@ install_system_deps() {
         sudo apt-get update -y || warn "apt update failed (continuing)"
 
         # Required for the vault itself. Do NOT install libfuse2/libfuse2t64
-        # for this app (no fusepy). Need gocryptfs + fuse3/fusermount3.
+        # (no fusepy). Need gocryptfs + fuse3/fusermount3.
+        # Do NOT install gcc, acl, apparmor-utils.
         safe_apt_install gocryptfs 0 || true
         if ! command -v fusermount3 >/dev/null 2>&1 && ! command -v fusermount >/dev/null 2>&1; then
             safe_apt_install fuse3 0 || safe_apt_install fuse 0 || true
@@ -147,10 +135,9 @@ install_system_deps() {
         safe_apt_install gir1.2-ayatanaappindicator3-0.1 1 || \
             safe_apt_install gir1.2-appindicator3-0.1 1 || true
 
-        # AppArmor is optional/dead on Jetson; do not install it on tegra and
-        # do not call it from the unlock path.
+        # AppArmor is not used. Never install it on tegra; skip everywhere.
         if is_tegra; then
-            info "Skipping apparmor-utils on Jetson (optional; not used)"
+            info "Skipping apparmor-utils on Jetson (not used)"
         fi
     elif command -v dnf >/dev/null 2>&1; then
         sudo dnf install -y gocryptfs fuse3 python3-pip python3-gobject \
@@ -170,7 +157,7 @@ install_system_deps() {
 # 2. Copy application files
 # ---------------------------------------------------------------------------
 write_launcher() {
-    # $1=dest  uses VENV_DIR APP_DIR from parent
+    # $1=dest  $2=python target
     local dest="$1" target="$2"
     cat > "${dest}" <<LAUNCH
 #!/usr/bin/env bash
@@ -196,29 +183,18 @@ copy_app() {
     info "Installing application to ${APP_DIR}"
     mkdir -p "${APP_DIR}" "${BIN_DIR}"
     for f in vault_guardian.py tray_app.py setup_wizard.py vault_manager.py \
-             usb_monitor.py requirements.txt README.md vault-exec.c \
-             install-privileged.sh vault-guardian.service; do
+             usb_monitor.py requirements.txt README.md vault-guardian.service; do
         if [[ ! -f "${SRC_DIR}/${f}" ]]; then
             warn "missing ${f} (skipping)"
             continue
         fi
-        if [[ "${f}" == *.sh ]]; then
-            install -m 0755 "${SRC_DIR}/${f}" "${APP_DIR}/${f}"
-        else
-            install -m 0644 "${SRC_DIR}/${f}" "${APP_DIR}/${f}"
-        fi
+        install -m 0644 "${SRC_DIR}/${f}" "${APP_DIR}/${f}"
     done
-    if [[ -d "${SRC_DIR}/tests" ]]; then
-        mkdir -p "${APP_DIR}/tests"
-        install -m 0644 "${SRC_DIR}/tests/"* "${APP_DIR}/tests/" 2>/dev/null || true
-        chmod 0755 "${APP_DIR}/tests/"*.sh 2>/dev/null || true
-    fi
     chmod 0755 "${APP_DIR}/vault_guardian.py" \
                "${APP_DIR}/tray_app.py" \
                "${APP_DIR}/setup_wizard.py" \
                "${APP_DIR}/vault_manager.py" \
-               "${APP_DIR}/usb_monitor.py" \
-               "${APP_DIR}/install-privileged.sh" 2>/dev/null || true
+               "${APP_DIR}/usb_monitor.py"
 
     write_launcher "${BIN_DIR}/vault-guardian" "vault_guardian.py"
     cat > "${BIN_DIR}/vault-guardian-setup" <<SETUP
@@ -325,21 +301,17 @@ main() {
     install_service
     run_setup
     echo
-    ok "User-level installation complete."
-    echo
-    echo "NOW run the one-time privileged installer (needs sudo):"
-    echo "    sudo ${SRC_DIR}/install-privileged.sh"
-    echo "  (or: sudo ${APP_DIR}/install-privileged.sh)"
-    echo
-    echo "That creates system user/group vaultguard, the sgid vault-exec"
-    echo "helper, sudoers, and ACLs. It will NOT add you to group vaultguard."
+    ok "Installation complete."
     echo
     echo "Then:"
     echo "  1. Start it:   systemctl --user start vault-guardian"
     echo "     (or just:   vault-guardian )"
     echo "  2. Look for the padlock icon in your system tray."
-    echo "  3. Unlock, then open files via 'Open with allowed app…'"
-    echo "     (ls ~/Vault as yourself will get EACCES — that is success)."
+    echo "  3. Plug the USB key, type the password, use ~/Vault normally."
+    echo "  4. Unplug the USB key to lock."
+    echo
+    echo "While unlocked, any process running as you can read ~/Vault."
+    echo "USB + password is the gate."
     echo
     echo "Python packages live in ${VENV_DIR} (not system Python)."
     echo "Read the README for the security model and its honest limits."
