@@ -5,20 +5,22 @@ tray_app.py
 The main Vault Guardian system-tray application. It wires together:
 
   * usb_monitor   - detects the registered USB key add/remove
-  * vault_manager - gocryptfs mount/unmount as system user vaultguard
+  * vault_manager - gocryptfs mount/unmount as the login user
   * setup_wizard  - config load/save
 
 State machine
 -------------
-  LOCKED  --(key inserted / manual mount)-->  OPEN
-  OPEN    --(key removed / Lock Now / suspend)--> LOCKED
+  LOCKED  --(key inserted / manual unlock)-->  OPEN
+  OPEN    --(key removed / Lock Now / suspend / quit)--> LOCKED
 
-When OPEN, gocryptfs runs as vaultguard with -allow_other. ~/Vault is
-vaultguard:vaultguard 0750. The login user is NOT in that group. Allowed
-apps reach the plaintext only when launched via /usr/local/bin/vault-exec
-(sgid vaultguard). python/cat/Cursor as the login user get EACCES.
+When OPEN, gocryptfs mounts ~/.vault-encrypted onto ~/Vault as the login
+user. ~/Vault is a normal folder: ls, firefox, and your editor all work.
+While unlocked, any same-UID process can read it. USB + password is the gate.
 
-Auto-unlock blobs are ignored: a same-user agent can read them.
+Headless: if DISPLAY/WAYLAND_DISPLAY is missing the tray is skipped, but
+the USB monitor still runs so unplug-to-lock works. Do not crash.
+
+Auto-unlock blobs are ignored and wiped: a same-user agent can read them.
 """
 
 from __future__ import annotations
@@ -31,14 +33,13 @@ import sys
 import threading
 import time
 from datetime import datetime
-from typing import List, Optional
+from typing import Optional
 
 import setup_wizard as cfgmod
 import usb_monitor
 import vault_manager
 
 APP_DIR = os.path.dirname(os.path.realpath(__file__))
-VAULT_EXEC = "/usr/local/bin/vault-exec"
 
 
 # ---------------------------------------------------------------------------
@@ -96,68 +97,6 @@ def ask_password(prompt: str = "Enter vault password") -> Optional[str]:
     return pw
 
 
-def edit_allowed_apps(current: List[str]) -> Optional[List[str]]:
-    """GTK dialog to add/remove allowed apps. Returns new list or None."""
-    try:
-        Gtk, _ = _gtk()
-    except Exception:
-        return None
-
-    dialog = Gtk.Dialog(title="Vault Guardian - Allowed Apps")
-    dialog.set_default_size(360, 320)
-    dialog.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
-                       Gtk.STOCK_SAVE, Gtk.ResponseType.OK)
-    box = dialog.get_content_area()
-    box.set_border_width(12)
-    box.set_spacing(6)
-    box.add(Gtk.Label(label="Only these apps may be launched via vault-exec:"))
-
-    store = Gtk.ListStore(str)
-    for a in current:
-        store.append([a])
-    tree = Gtk.TreeView(model=store)
-    renderer = Gtk.CellRendererText()
-    col = Gtk.TreeViewColumn("Application", renderer, text=0)
-    tree.append_column(col)
-    scroll = Gtk.ScrolledWindow()
-    scroll.set_vexpand(True)
-    scroll.add(tree)
-    box.add(scroll)
-
-    entry = Gtk.Entry()
-    entry.set_placeholder_text("app name or /path/to/binary")
-    box.add(entry)
-
-    btnbox = Gtk.Box(spacing=6)
-    add_btn = Gtk.Button(label="Add")
-    rm_btn = Gtk.Button(label="Remove selected")
-    btnbox.add(add_btn)
-    btnbox.add(rm_btn)
-    box.add(btnbox)
-
-    def on_add(_):
-        name = entry.get_text().strip()
-        if name:
-            store.append([name])
-            entry.set_text("")
-
-    def on_remove(_):
-        model, it = tree.get_selection().get_selected()
-        if it is not None:
-            model.remove(it)
-
-    add_btn.connect("clicked", on_add)
-    rm_btn.connect("clicked", on_remove)
-
-    dialog.show_all()
-    resp = dialog.run()
-    result = None
-    if resp == Gtk.ResponseType.OK:
-        result = [row[0] for row in store]
-    dialog.destroy()
-    return result
-
-
 def show_message(title: str, text: str) -> None:
     try:
         Gtk, _ = _gtk()
@@ -209,16 +148,6 @@ def _ensure_display_env() -> None:
         if os.path.exists(sock):
             os.environ.setdefault("DISPLAY", display)
             break
-
-
-def _vault_exec_path() -> str:
-    if os.path.isfile(VAULT_EXEC):
-        return VAULT_EXEC
-    local = os.path.join(APP_DIR, "vault-exec")
-    if os.path.isfile(local):
-        return local
-    w = shutil.which("vault-exec")
-    return w or VAULT_EXEC
 
 
 # ---------------------------------------------------------------------------
@@ -281,9 +210,9 @@ class VaultGuardian:
                 log_event("ERROR", "mount did not appear; vault stays locked")
                 show_message(
                     "Unlock failed",
-                    "gocryptfs did not mount. Check the password, or run "
-                    "sudo ./install-privileged.sh if the sudoers helper "
-                    "is missing.")
+                    "gocryptfs did not mount. Check the password. If leftover "
+                    "files in ~/Vault blocked the mount, empty that folder "
+                    "(or keep -nonempty, which is the default).")
                 return False
 
             log_event("OPEN", f"vault open at {mount}")
@@ -294,7 +223,6 @@ class VaultGuardian:
         with self.state_lock:
             mount = self.cfg["mount_point"]
             log_event("LOCK", f"lock requested ({reason})")
-            # gocryptfs is the FUSE server; unmount is enough.
             try:
                 vault_manager.unmount_vault(mount)
             except vault_manager.VaultError as e:
@@ -379,77 +307,6 @@ class VaultGuardian:
         except Exception:
             pass
 
-    def _save_allowed_apps(self, new: List[str]) -> None:
-        resolved = cfgmod.resolve_allowed_apps(new)
-        self.cfg["allowed_apps"] = resolved
-        cfgmod.save_config(self.cfg)
-        dest = cfgmod.install_allowlist(resolved)
-        log_event("CONFIG", f"allowed apps updated ({dest}): {resolved}")
-        if dest == "user":
-            show_message(
-                "Vault Guardian",
-                "Saved a local allowlist at ~/.config/vault-guardian/allowed-apps.\n"
-                "vault-exec reads /etc/vault-guardian/allowed-apps, so run:\n"
-                "  sudo ./install-privileged.sh --sync-allowlist")
-        else:
-            show_message("Vault Guardian", "Allowed apps saved to the system allowlist.")
-
-    def _open_with_allowed_app(self) -> None:
-        apps = list(self.cfg.get("allowed_apps") or [])
-        if not apps:
-            show_message("Vault Guardian", "No allowed apps configured.")
-            return
-        if not self.is_open:
-            show_message("Vault Guardian", "Unlock the vault first.")
-            return
-        helper = _vault_exec_path()
-        if not os.path.isfile(helper):
-            show_message(
-                "Vault Guardian",
-                "vault-exec is not installed. Run:\n"
-                "  sudo ./install-privileged.sh")
-            return
-
-        choice = apps[0]
-        try:
-            Gtk, _ = _gtk()
-        except Exception:
-            Gtk = None
-        if Gtk is not None:
-            dialog = Gtk.Dialog(title="Vault Guardian - Open with allowed app")
-            dialog.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
-                               Gtk.STOCK_OK, Gtk.ResponseType.OK)
-            box = dialog.get_content_area()
-            box.set_border_width(12)
-            box.set_spacing(6)
-            box.add(Gtk.Label(label="Launch via vault-exec (sgid vaultguard):"))
-            combo = Gtk.ComboBoxText()
-            for a in apps:
-                combo.append_text(a)
-            combo.set_active(0)
-            box.add(combo)
-            dialog.show_all()
-            resp = dialog.run()
-            idx = combo.get_active()
-            dialog.destroy()
-            if resp != Gtk.ResponseType.OK or not (0 <= idx < len(apps)):
-                return
-            choice = apps[idx]
-
-        resolved = cfgmod.resolve_app_path(choice)
-        if not os.path.isfile(resolved):
-            show_message("Vault Guardian", f"Cannot find binary: {choice}")
-            return
-        mount = self.cfg["mount_point"]
-        try:
-            subprocess.Popen(
-                [helper, resolved, mount],
-                start_new_session=True,
-            )
-            log_event("EXEC", f"vault-exec {resolved} {mount}")
-        except Exception as e:
-            show_message("Vault Guardian", f"Failed to launch: {e}")
-
     def _build_menu(self):
         from pystray import MenuItem as Item, Menu
 
@@ -461,14 +318,6 @@ class VaultGuardian:
 
         def do_open(icon, item):
             self.open_vault(reason="tray")
-
-        def do_apps(icon, item):
-            new = edit_allowed_apps(list(self.cfg["allowed_apps"]))
-            if new is not None:
-                self._save_allowed_apps(new)
-
-        def do_open_app(icon, item):
-            self._open_with_allowed_app()
 
         def do_usb(icon, item):
             self._reregister_usb()
@@ -487,11 +336,7 @@ class VaultGuardian:
                  enabled=lambda i: (not self.is_open)
                  and bool(cfgmod.load_config())),
             Item("Lock Now", do_lock, enabled=lambda i: self.is_open),
-            Item("Open with allowed app…",
-                 do_open_app,
-                 enabled=lambda i: self.is_open),
             Menu.SEPARATOR,
-            Item("Allowed Apps...", do_apps),
             Item("Change USB Key...", do_usb),
             Item("View Access Log", do_log),
             Menu.SEPARATOR,
@@ -549,7 +394,6 @@ class VaultGuardian:
             if not path:
                 continue
             try:
-                # Log is in the user's home (mode 600), not the vault.
                 subprocess.Popen([path, cfgmod.LOG_PATH],
                                  start_new_session=True)
                 return

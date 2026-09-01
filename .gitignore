@@ -4,6 +4,3 @@ __pycache__/
 *.egg-info/
 .venv/
 venv/
-
-# compiled helper (source is vault-exec.c)
-vault-exec
