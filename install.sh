@@ -298,8 +298,8 @@ main() {
     copy_app
     install_python_deps
     install_udev_rule
-    install_service
     run_setup
+    install_service
     echo
     ok "Installation complete."
     echo

@@ -477,12 +477,20 @@ def main() -> None:
         sys.exit(1)
 
     if not os.path.isfile(cfgmod.CONFIG_PATH):
-        print("No config found. Running first-time setup...", file=sys.stderr)
-        try:
-            cfgmod.run_wizard()
-        except Exception as e:
-            print(f"Setup failed: {e}", file=sys.stderr)
-            sys.exit(1)
+        if sys.stdin.isatty():
+            print("No config found. Running first-time setup...", file=sys.stderr)
+            try:
+                cfgmod.run_wizard()
+            except Exception as e:
+                print(f"Setup failed: {e}", file=sys.stderr)
+                sys.exit(1)
+        else:
+            # systemd has no TTY. Do not exit 1 (that restart-loops). Wait
+            # until vault-guardian-setup writes the config.
+            print("No config yet; waiting for vault-guardian-setup "
+                  "(not prompting: no TTY).", file=sys.stderr)
+            while not os.path.isfile(cfgmod.CONFIG_PATH):
+                time.sleep(1)
 
     VaultGuardian().run()
 
